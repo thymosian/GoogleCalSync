@@ -1,0 +1,15 @@
+{
+  "watch": ["server", "shared"],
+  "ext": "ts,js,json",
+  "ignore": [
+    "node_modules",
+    "dist",
+    "client",
+    "**/*.test.ts",
+    "**/__tests__/**"
+  ],
+  "exec": "tsx --env-file=.env server/index.ts",
+  "env": {
+    "NODE_ENV": "development"
+  }
+}

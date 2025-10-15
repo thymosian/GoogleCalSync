@@ -1,0 +1,143 @@
+## **App Overview**
+
+This web application integrates tightly with Google Calendar to help users manage events, schedule meetings, and automate post-meeting workflows. It blends conversational AI with productivity tools to create a seamless, end-to-end experience.
+
+---
+
+## **Core Features**
+
+### 1. **Google Authentication & Calendar Integration**
+
+- Users sign in with Google.
+    
+- The app requests access to their Google Calendar.
+    
+- All upcoming events are fetched and displayed in a sidebar:
+    
+    - Event title, time, and date.
+        
+    - Meeting links (if applicable).
+        
+    - Option to delete events.
+        
+    - Optional dropdown to view event details or make inquiries.
+        
+
+---
+
+### 2. **Main Interface**
+
+- **Chat Section**
+    
+    - A conversational AI interface greets the user, with greetings synced to their local device time or Google Calendar time.
+        
+    - Users can ask questions, schedule events, or get summaries of upcoming meetings.
+        
+- **Quick-Action Buttons**
+    
+    - Prompt suggestions (e.g., “I want to schedule a meeting with…”).
+        
+    - A “Surprise Me” button that surfaces random but useful prompts the app can handle.
+        
+    - Clickable actions for common tasks (e.g., “Summarize my next event”).
+        
+
+---
+
+### 3. **AI-Assisted Scheduling**
+
+- Users chat with the AI to schedule events.
+    
+- The AI generates **intelligent event titles** from conversation context (users don’t need to name events manually).
+    
+- The AI suggests the **best time and date** based on the user’s availability in Google Calendar.
+    
+- Users provide or confirm:
+    
+    - Meeting link (if online).
+        
+    - Attendees.
+        
+
+---
+
+### 4. **Agenda Generation & Distribution**
+
+- When a meeting link and attendees are provided, the system:
+    
+    - Automatically generates a professional agenda for the meeting.
+        
+    - Sends the agenda to attendees via email.
+        
+
+---
+
+### 5. **Simulated Meeting Recording & Transcript**
+
+- To simulate the system “joining” a meeting:
+    
+    - The AI generates a **75–100-message transcript** using the agenda as context.
+        
+    - The transcript is saved in a local `/transcripts` directory to simulate Google Drive integration.
+        
+    - After analysis, the transcript is automatically deleted.
+        
+
+---
+
+### 6. **AI-Powered Analysis & Summary**
+
+- The stored transcript is analyzed by the AI.
+    
+- A concise **summary** of the meeting is emailed to attendees.
+    
+- From the summary, the system generates **action plans**:
+    
+    - Tasks.
+        
+    - Assignees.
+        
+    - Deadlines.
+        
+
+---
+
+### 7. **Task Boards & Action Plan Management**
+
+- A dedicated UI section allows users to view and manage action plans.
+    
+- For each meeting:
+    
+    - A board is automatically created.
+        
+    - Tasks from the action plan are assigned to appropriate attendees.
+        
+- Clicking a meeting shows all related tasks, assignees, and progress.
+    
+
+---
+
+## **Key Automation Workflow**
+
+1. User schedules meeting →
+    
+2. AI generates title, agenda, and emails agenda to attendees →
+    
+3. System simulates meeting transcript →
+    
+4. AI analyzes transcript →
+    
+5. Summary emailed to attendees →
+    
+6. Action plan automatically generated →
+    
+7. Tasks assigned to attendees via boards →
+    
+8. Transcript automatically deleted after processing.
+    
+
+---
+
+## **Outcome**
+
+This app combines conversational AI, scheduling intelligence, and automated task management into one seamless platform. It doesn’t just help users **schedule** meetings—it helps them **manage the entire lifecycle**: from planning to execution to follow-up.
