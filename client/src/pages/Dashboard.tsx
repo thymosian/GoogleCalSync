@@ -3,12 +3,18 @@ import { CalendarSidebar } from '@/components/CalendarSidebar';
 import { ChatInterface } from '@/components/ChatInterface';
 import { TaskBoard } from '@/components/TaskBoard';
 import { ThemeToggle } from '@/components/ThemeToggle';
+import { OnboardingMeetingSetup } from '@/components/OnboardingMeetingSetup';
+import { SimpleNavbar } from '@/components/SimpleNavbar';
+import { SimpleSidebar } from '@/components/SimpleSidebar';
+import { MainContentTabs } from '@/components/MainContentTabs';
+import { AIAssistantToggle } from '@/components/AIAssistantToggle';
+import { PremiumLoading } from '@/components/PremiumLoading';
 import { Card, CardContent, CardHeader, CardTitle } from '@/components/ui/card';
 import { Button } from '@/components/ui/button';
 import { Badge } from '@/components/ui/badge';
-import { Avatar, AvatarFallback, AvatarImage } from '@/components/ui/avatar';
 import { Tabs, TabsContent, TabsList, TabsTrigger } from '@/components/ui/tabs';
-import { Bot, Calendar, CheckSquare, User, LogOut } from 'lucide-react';
+import { Avatar, AvatarFallback, AvatarImage } from '@/components/ui/avatar';
+import { Bot, Calendar, CheckSquare, User, LogOut, Clock, Users, ExternalLink, Video, X } from 'lucide-react';
 import { addDays, addHours } from 'date-fns';
 import { useAuth } from '@/hooks/useAuth';
 import { useQuery, useQueryClient } from '@tanstack/react-query';
@@ -58,6 +64,87 @@ interface CalendarEvent {
   attendees: string[];
 }
 
+// Event Card Component
+interface EventCardProps {
+  event: CalendarEvent;
+  onJoin: (eventId: string) => void;
+  onViewDetails: (eventId: string) => void;
+}
+
+function EventCard({ event, onJoin, onViewDetails }: EventCardProps) {
+  const isUpcoming = new Date(event.startTime) > new Date();
+  const isToday = new Date(event.startTime).toDateString() === new Date().toDateString();
+
+  return (
+    <Card className="hover:shadow-md transition-shadow">
+      <CardContent className="p-4">
+        <div className="flex items-start justify-between">
+          <div className="flex-1">
+            <div className="flex items-center gap-2 mb-2">
+              <h4 className="font-semibold">{event.title}</h4>
+              {isToday && (
+                <Badge variant="secondary" className="text-xs">Today</Badge>
+              )}
+            </div>
+
+            <div className="flex items-center gap-4 text-sm text-muted-foreground mb-3">
+              <div className="flex items-center gap-1">
+                <Calendar className="h-3 w-3" />
+                {new Date(event.startTime).toLocaleDateString()}
+              </div>
+              <div className="flex items-center gap-1">
+                <Clock className="h-3 w-3" />
+                {new Date(event.startTime).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' })}
+              </div>
+            </div>
+
+            {event.attendees.length > 0 && (
+              <div className="flex items-center gap-1 mb-3">
+                <Users className="h-3 w-3 text-muted-foreground" />
+                <span className="text-xs text-muted-foreground">
+                  {event.attendees.length} attendee{event.attendees.length !== 1 ? 's' : ''}
+                </span>
+              </div>
+            )}
+
+            <div className="flex gap-2">
+              {isUpcoming && event.meetingLink && (
+                <Button
+                  size="sm"
+                  onClick={() => onJoin(event.id)}
+                  className="bg-green-500 hover:bg-green-600"
+                >
+                  Join Meeting
+                </Button>
+              )}
+              <Button
+                variant="outline"
+                size="sm"
+                onClick={() => onViewDetails(event.id)}
+              >
+                View Details
+              </Button>
+            </div>
+          </div>
+
+          {event.meetingLink && (
+            <div className="ml-4">
+              <Button
+                variant="ghost"
+                size="icon"
+                onClick={() => window.open(event.meetingLink, '_blank')}
+                title="Open meeting link"
+              >
+                <ExternalLink className="h-4 w-4" />
+              </Button>
+            </div>
+          )}
+        </div>
+      </CardContent>
+    </Card>
+  );
+}
+
 // Import enhanced ChatMessage from shared schema to support UI blocks
 import { EnhancedChatMessage as ChatMessage, UIBlock } from '../../../shared/schema';
 
@@ -90,17 +177,34 @@ interface Task {
 export default function Dashboard() {
   const { user, logout, isLoggingOut } = useAuth();
   const queryClient = useQueryClient();
-  const [tasks, setTasks] = useState<Task[]>(mockTasks);
+  const [tasks, setTasks] = useState<Task[]>([]);
   const [chatMessages, setChatMessages] = useState<ChatMessage[]>([]);
   const [isLoading, setIsLoading] = useState(false);
-  const [sidebarWidth, setSidebarWidth] = useState(320); // 320px = 80 * 4 (w-80 in Tailwind)
-  const [isResizing, setIsResizing] = useState(false);
-  const sidebarRef = useRef<HTMLDivElement>(null);
-  
+
+
   // New state for conversational API integration
   const [activeUIBlock, setActiveUIBlock] = useState<UIBlock | null>(null);
   const [conversationId, setConversationId] = useState<string>('');
   const [workflowState, setWorkflowState] = useState<any>(null);
+
+
+
+  // Premium dashboard state
+  const [activeTab, setActiveTab] = useState<'events' | 'tasks'>('events');
+  const [isSidebarOpen, setIsSidebarOpen] = useState(true); // Open sidebar by default
+  const [sidebarWidth, setSidebarWidth] = useState(400);
+
+  // Process restart functionality
+  const handleRestartProcess = () => {
+    // Reset process - handled by MainContentTabs
+  };
+
+  // Handle sidebar updates when new meetings are created
+  const handleSidebarUpdate = (updatedMeetingData: any) => {
+    console.log('Sidebar should be updated with:', updatedMeetingData);
+    // Refresh the calendar events when a new meeting is created
+    queryClient.invalidateQueries({ queryKey: ['calendarEvents'] });
+  };
   
   // Set the initial greeting message with the user's name
   useEffect(() => {
@@ -434,11 +538,11 @@ export default function Dashboard() {
       const response = await fetch('/api/calendar/events', {
         credentials: 'include'
       });
-      
+
       if (!response.ok) {
         throw new Error('Failed to fetch calendar events');
       }
-      
+
       const data = await response.json();
       // Convert date strings to Date objects
       return data.events.map((event: any) => ({
@@ -451,14 +555,42 @@ export default function Dashboard() {
     refetchOnWindowFocus: true,
   });
 
-  const handleDeleteEvent = async (eventId: string) => {
-    // Show confirmation dialog
-    const confirmed = window.confirm('Are you sure you want to delete this event? This action cannot be undone.');
-    
-    if (!confirmed) {
-      return; // User cancelled the deletion
-    }
+  // Fetch tasks from database
+  const { data: dbTasks = [], isLoading: isTasksLoading } = useQuery({
+    queryKey: ['meetingTasks'],
+    queryFn: async (): Promise<Task[]> => {
+      const response = await fetch('/api/tasks', {
+        credentials: 'include'
+      });
 
+      if (!response.ok) {
+        throw new Error('Failed to fetch tasks');
+      }
+
+      const data = await response.json();
+      // Convert date strings to Date objects and ensure proper typing
+      return data.tasks.map((task: any) => ({
+        ...task,
+        deadline: task.deadline ? new Date(task.deadline) : undefined,
+        status: task.status as 'pending' | 'in_progress' | 'completed',
+        eventTitle: task.eventTitle || task.meetingTitle || 'Meeting'
+      }));
+    },
+    staleTime: 2 * 60 * 1000, // 2 minutes
+    refetchOnWindowFocus: true,
+  });
+
+  // Use database tasks if available, otherwise fall back to mock tasks
+  const displayTasks = dbTasks.length > 0 ? dbTasks : mockTasks;
+
+  // Update local tasks state when database tasks are fetched
+  useEffect(() => {
+    if (dbTasks.length > 0) {
+      setTasks(dbTasks);
+    }
+  }, [dbTasks]);
+
+  const handleDeleteEvent = async (eventId: string) => {
     try {
       const response = await fetch(`/api/calendar/events/${eventId}`, {
         method: 'DELETE',
@@ -542,12 +674,38 @@ export default function Dashboard() {
     }
   };
 
-  const handleUpdateTaskStatus = (taskId: string, status: 'pending' | 'in_progress' | 'completed') => {
-    const updatedTasks = tasks.map(task => 
-      task.id === taskId ? { ...task, status } : task
-    );
-    setTasks(updatedTasks);
-    console.log('Task updated:', taskId, status);
+  const handleUpdateTaskStatus = async (taskId: string, status: 'pending' | 'in_progress' | 'completed') => {
+    try {
+      // Update local state immediately for better UX
+      const updatedTasks = tasks.map(task =>
+        task.id === taskId ? { ...task, status } : task
+      );
+      setTasks(updatedTasks);
+
+      // Update in database
+      const response = await fetch(`/api/tasks/${taskId}`, {
+        method: 'PATCH',
+        headers: {
+          'Content-Type': 'application/json',
+        },
+        credentials: 'include',
+        body: JSON.stringify({ status })
+      });
+
+      if (!response.ok) {
+        throw new Error('Failed to update task in database');
+      }
+
+      console.log('Task updated:', taskId, status);
+
+      // Refresh tasks from database to ensure consistency
+      queryClient.invalidateQueries({ queryKey: ['meetingTasks'] });
+    } catch (error) {
+      console.error('Error updating task status:', error);
+
+      // Revert local state on error
+      queryClient.invalidateQueries({ queryKey: ['meetingTasks'] });
+    }
   };
 
   const handleTaskClick = (task: Task) => {
@@ -569,187 +727,78 @@ export default function Dashboard() {
     logout();
   };
 
-  // Resizing functionality
-  const startResizing = (e: React.MouseEvent) => {
-    e.preventDefault();
-    setIsResizing(true);
+
+  // AI Assistant Panel state
+
+
+  // Handle AI prompt from navbar
+  const handleAIPrompt = (prompt: string) => {
+    handleSendMessage(prompt);
   };
 
-  useEffect(() => {
-    const handleMouseMove = (e: MouseEvent) => {
-      if (!isResizing) return;
-      
-      // Calculate new width based on mouse position
-      const newWidth = e.clientX;
-      
-      // Set minimum and maximum width constraints
-      if (newWidth > 200 && newWidth < 600) {
-        setSidebarWidth(newWidth);
-      }
-    };
-
-    const handleMouseUp = () => {
-      setIsResizing(false);
-    };
-
-    if (isResizing) {
-      document.addEventListener('mousemove', handleMouseMove);
-      document.addEventListener('mouseup', handleMouseUp);
-    }
-
-    return () => {
-      document.removeEventListener('mousemove', handleMouseMove);
-      document.removeEventListener('mouseup', handleMouseUp);
-    };
-  }, [isResizing]);
-
   return (
-    <div className="h-screen bg-background flex flex-col">
-      {/* Header */}
-      <header className="border-b bg-card">
-        <div className="flex items-center justify-between p-4">
-          <div className="flex items-center gap-3">
-            <div className="p-2 bg-primary/10 rounded-lg">
-              <Bot className="h-6 w-6 text-primary" />
-            </div>
-            <div>
-              <h1 className="text-xl font-semibold">AI Calendar Assistant</h1>
-              <p className="text-sm text-muted-foreground">Intelligent meeting management</p>
-            </div>
-          </div>
-          
-          <div className="flex items-center gap-3">
-            <Badge variant="secondary" className="text-xs">
-              {events.length} upcoming events
-            </Badge>
-            <Badge variant="secondary" className="text-xs">
-              {tasks.filter(t => t.status !== 'completed').length} active tasks
-            </Badge>
-            <ThemeToggle />
-            <div className="flex items-center gap-2">
-              <Avatar className="h-8 w-8">
-                <AvatarImage src={user?.picture} />
-                <AvatarFallback>
-                  <User className="h-4 w-4" />
-                </AvatarFallback>
-              </Avatar>
-              <div className="text-sm">
-                <div className="font-medium">{user?.name || 'User'}</div>
-                <div className="text-muted-foreground text-xs">{user?.email || ''}</div>
-              </div>
-              <Button 
-                variant="ghost" 
-                size="icon"
-                onClick={handleSignOut}
-                disabled={isLoggingOut}
-                data-testid="button-sign-out"
-              >
-                <LogOut className="h-4 w-4" />
-              </Button>
-            </div>
-          </div>
-        </div>
-      </header>
+    <div className="h-screen bg-background flex flex-col relative overflow-hidden">
+      {/* Simple Navbar */}
+      <SimpleNavbar
+        onToggleSidebar={() => setIsSidebarOpen(!isSidebarOpen)}
+        isSidebarOpen={isSidebarOpen}
+        user={user || undefined}
+        onLogout={logout}
+      />
 
-      {/* Main Content */}
-      <div className="flex-1 flex min-h-0">
-        {/* Calendar Sidebar Container */}
+      {/* Main Layout */}
+      <div className="flex-1 flex min-h-0 pt-16"> {/* Add padding for fixed navbar */}
+        {/* Sidebar */}
+        <SimpleSidebar
+          events={events}
+          onJoinEvent={(eventId) => {
+            const event = events.find(e => e.id === eventId);
+            if (event?.meetingLink) {
+              window.open(event.meetingLink, '_blank');
+            }
+          }}
+          onViewEvent={(eventId) => {
+            const event = events.find(e => e.id === eventId);
+            if (event) handleEventClick(event);
+          }}
+          onDeleteEvent={handleDeleteEvent}
+          isOpen={isSidebarOpen}
+          width={sidebarWidth}
+          onWidthChange={setSidebarWidth}
+        />
+
+        {/* Main Content */}
         <div 
-          ref={sidebarRef}
-          className="relative h-full flex"
-          style={{ width: `${sidebarWidth}px` }}
+          className="flex-1 transition-all duration-300"
+          style={{ 
+            marginLeft: isSidebarOpen ? sidebarWidth : 0 
+          }}
         >
-          {/* Sidebar Background - Full Height */}
-          <div className="absolute inset-0 border-r bg-card"></div>
-          
-          {/* Sidebar Content - Scrollable with infinite padding */}
-          <aside 
-            className="relative z-10 h-full w-full overflow-y-auto"
-            data-testid="sidebar-scroll-area"
-          >
-            <div className="p-4 min-h-full">
-              <CalendarSidebar 
-                events={events}
-                onDeleteEvent={handleDeleteEvent}
-                onEventClick={handleEventClick}
-              />
-            </div>
-          </aside>
-          
-          {/* Resizer handle */}
-          <div
-            className="absolute top-0 right-0 h-full w-2 cursor-col-resize bg-transparent hover:bg-primary/20 transition-colors z-20"
-            onMouseDown={startResizing}
+          <MainContentTabs
+            tasks={tasks}
+            onTaskUpdate={setTasks}
+            onSidebarUpdate={handleSidebarUpdate}
+            onRestartProcess={handleRestartProcess}
+            activeTab={activeTab}
+            onTabChange={setActiveTab}
+            isSidebarOpen={isSidebarOpen}
+            sidebarWidth={sidebarWidth}
           />
         </div>
-
-        {/* Main Panel */}
-        <main 
-          className="flex-1 overflow-y-auto"
-          data-testid="main-scroll-area"
-        >
-          <Tabs defaultValue="chat" className="h-full flex flex-col">
-            <TabsList className="grid w-full grid-cols-2">
-              <TabsTrigger value="chat" className="flex items-center gap-2">
-                <Bot className="h-4 w-4" />
-                AI Assistant
-              </TabsTrigger>
-              <TabsTrigger value="tasks" className="flex items-center gap-2">
-                <CheckSquare className="h-4 w-4" />
-                Task Boards
-              </TabsTrigger>
-            </TabsList>
-            
-            <TabsContent value="chat" className="flex-1 mt-0 h-full">
-              <Card className="h-full flex flex-col">
-                <CardHeader className="pb-4 border-b">
-                  <CardTitle className="flex items-center gap-2 text-lg">
-                    <Bot className="h-5 w-5" />
-                    AI Calendar Assistant
-                  </CardTitle>
-                </CardHeader>
-                <CardContent className="flex-1 p-0">
-                  <ChatInterface
-                    messages={chatMessages}
-                    onSendMessage={handleSendMessage}
-                    onAddAssistantMessage={handleAddAssistantMessage}
-                    isLoading={isLoading}
-                    userName={user?.name || 'User'}
-                    userAvatar={user?.picture}
-                    onTypeSelect={handleTypeSelect}
-                    onAttendeesUpdate={handleAttendeesUpdate}
-                    onContinue={handleContinue}
-                    onApprove={handleApprove}
-                    onEdit={handleEdit}
-                    onAgendaUpdate={handleAgendaUpdate}
-                    onAgendaApprove={handleAgendaApprove}
-                    onAgendaRegenerate={handleAgendaRegenerate}
-                  />
-                </CardContent>
-              </Card>
-            </TabsContent>
-            
-            <TabsContent value="tasks" className="flex-1 mt-0 h-full">
-              <Card className="h-full flex flex-col">
-                <CardHeader className="pb-4 border-b">
-                  <CardTitle className="flex items-center gap-2 text-lg">
-                    <CheckSquare className="h-5 w-5" />
-                    Action Plans & Tasks
-                  </CardTitle>
-                </CardHeader>
-                <CardContent className="flex-1 p-0">
-                  <TaskBoard
-                    tasks={tasks}
-                    onUpdateTaskStatus={handleUpdateTaskStatus}
-                    onTaskClick={handleTaskClick}
-                    onAddTask={handleAddTask}
-                  />
-                </CardContent>
-              </Card>
-            </TabsContent>
-          </Tabs>
-        </main>
       </div>
+
+      {/* AI Assistant Toggle */}
+      <AIAssistantToggle
+        onAIPrompt={handleAIPrompt}
+        chatMessages={chatMessages}
+        onSendMessage={handleSendMessage}
+        isLoading={isLoading}
+        activeUIBlock={activeUIBlock}
+        onTypeSelect={handleTypeSelect}
+        onAttendeesUpdate={handleAttendeesUpdate}
+        onContinue={handleContinue}
+        onApprove={handleApprove}
+      />
     </div>
   );
 }

@@ -87,7 +87,7 @@ Guidelines:
 - Always verify facts before stating them
 - If uncertain, ask for clarification`;
 
-// Get Gemini model instance with configuration
+// Get Gemini model instance with configuration and fallback support
 function getGeminiModel(config: Partial<GeminiConfig> = {}): GenerativeModel {
     const finalConfig = { ...defaultConfig, ...config };
 
@@ -98,22 +98,55 @@ function getGeminiModel(config: Partial<GeminiConfig> = {}): GenerativeModel {
         maxOutputTokens: finalConfig.maxOutputTokens,
     };
 
-    const model = genAI.getGenerativeModel({
-        model: finalConfig.model,
-        generationConfig,
-        systemInstruction: SYSTEM_PROMPT,
-    });
+    // Try experimental model first, fallback to stable model if needed
+    const models = [
+        finalConfig.model, // Primary model (gemini-2.0-flash-exp)
+        'gemini-1.5-flash', // Fallback model
+        'gemini-1.5-pro' // Last resort fallback
+    ];
 
-    return model;
+    for (const modelName of models) {
+        try {
+            const model = genAI.getGenerativeModel({
+                model: modelName,
+                generationConfig,
+                systemInstruction: SYSTEM_PROMPT,
+            });
+
+            // Test if model is available by making a simple request
+            console.log(`Using Gemini model: ${modelName}`);
+            return model;
+        } catch (error) {
+            console.warn(`Failed to initialize model ${modelName}, trying fallback:`, error);
+            if (modelName === models[models.length - 1]) {
+                throw new Error(`All Gemini models failed. Last error: ${error}`);
+            }
+        }
+    }
+
+    // This should never be reached, but just in case
+    throw new Error('Failed to initialize any Gemini model');
 }
 
-// Basic error handling and logging setup
-function handleGeminiError(error: any, operation: string): Error {
-    console.error(`Gemini API error during ${operation}:`, error);
+// Enhanced error handling with retry logic for overloaded models
+async function handleGeminiError(error: any, operation: string, retryCount: number = 0): Promise<Error> {
+    console.error(`Gemini API error during ${operation} (attempt ${retryCount + 1}):`, error);
 
     // Log error details for monitoring
     if (error.status) {
         console.error(`Status: ${error.status}, Message: ${error.message}`);
+    }
+
+    // Handle 503 Service Unavailable (model overloaded) with retry
+    if (error.status === 503 && retryCount < 2) {
+        const delay = Math.pow(2, retryCount) * 1000; // Exponential backoff: 1s, 2s, 4s
+        console.log(`Model overloaded, retrying in ${delay}ms...`);
+
+        await new Promise(resolve => setTimeout(resolve, delay));
+
+        // Use existing AI service error handler for consistent error handling
+        const aiError = aiServiceErrorHandler.classifyError(error);
+        return new Error(`${aiError.message} (retry ${retryCount + 1}/3)`);
     }
 
     // Use existing AI service error handler for consistent error handling
@@ -257,10 +290,10 @@ export function filterAndConvertMessages(messages: MistralMessage[]): GeminiMess
 // Core response generation functions
 
 /**
- * Main Gemini response function
+ * Main Gemini response function with retry logic for overloaded models
  * Maintains the same interface for backward compatibility
  */
-export async function getGeminiResponse(messages: MistralMessage[]): Promise<string> {
+export async function getGeminiResponse(messages: MistralMessage[], retryCount: number = 0): Promise<string> {
     const startTime = Date.now();
     const inputText = messages.map(m => m.content).join(' ');
     const inputTokens = performanceMonitor.estimateTokenCount(inputText);
@@ -313,11 +346,19 @@ export async function getGeminiResponse(messages: MistralMessage[]): Promise<str
         const responseTime = Date.now() - startTime;
         const errorMessage = error.message || 'Unknown Gemini API error';
 
+        // Check if this is a 503 error and we haven't exceeded retry limit
+        if (error.status === 503 && retryCount < 2) {
+            console.log(`Gemini API overloaded, retrying (${retryCount + 1}/3)...`);
+            const delay = Math.pow(2, retryCount) * 1000; // Exponential backoff
+            await new Promise(resolve => setTimeout(resolve, delay));
+            return getGeminiResponse(messages, retryCount + 1);
+        }
+
         // Log failed call
         logFailedCall('general_response', inputTokens, responseTime, errorMessage, defaultConfig.model);
 
         // Handle error using existing error handler
-        throw handleGeminiError(error, 'general_response');
+        throw await handleGeminiError(error, 'general_response', retryCount);
     }
 }
 
@@ -420,12 +461,13 @@ export function logGeminiAPICall(
 }
 
 /**
- * Enhanced meeting intent extraction with conversation awareness
+ * Enhanced meeting intent extraction with conversation awareness and retry logic
  */
 export async function extractMeetingIntent(
     userMessageOrMessages: string | ConversationMessage[],
     conversationContextOrEngine?: ConversationMessage[] | any,
-    currentMeetingData?: MeetingData
+    currentMeetingData?: MeetingData,
+    retryCount: number = 0
 ): Promise<MeetingExtraction & { contextualConfidence: number; extractedFields?: any; missingFields?: string[] }> {
 
     // Handle both old and new function signatures for backward compatibility
@@ -521,11 +563,19 @@ export async function extractMeetingIntent(
         const responseTime = Date.now() - startTime;
         const errorMessage = error.message || 'Unknown Gemini API error';
 
+        // Check if this is a 503 error and we haven't exceeded retry limit
+        if (error.status === 503 && retryCount < 2) {
+            console.log(`Gemini API overloaded for intent extraction, retrying (${retryCount + 1}/3)...`);
+            const delay = Math.pow(2, retryCount) * 1000; // Exponential backoff
+            await new Promise(resolve => setTimeout(resolve, delay));
+            return extractMeetingIntent(userMessageOrMessages, conversationContextOrEngine, currentMeetingData, retryCount + 1);
+        }
+
         // Log failed call
         logFailedCall('meeting_intent_extraction', inputTokens, responseTime, errorMessage, 'gemini-1.5-flash');
 
         console.error('Error extracting meeting intent:', error);
-        throw handleGeminiError(error, 'meeting_intent_extraction');
+        throw await handleGeminiError(error, 'meeting_intent_extraction', retryCount);
     }
 }
 
@@ -798,6 +848,154 @@ export async function generateMeetingTitles(purpose: string, participants: strin
         console.error('Error generating meeting titles:', error);
         throw handleGeminiError(error, 'meeting_title_generation');
     }
+}
+
+/**
+ * Enhance and expand meeting purpose into detailed wording
+ */
+export async function enhancePurposeWording(
+    purpose: string,
+    title: string,
+    participants: string[] = [],
+    context: string = ''
+): Promise<{ enhancedPurpose: string; keyPoints: string[] }> {
+  const purposePrompt = MEETING_CREATION_PROMPTS.PURPOSE_ENHANCEMENT
+      .replace('{purpose}', purpose)
+      .replace('{title}', title)
+      .replace('{participants}', JSON.stringify(participants))
+      .replace('{context}', context);
+
+  console.log('Purpose enhancement request:', {
+    purposeLength: purpose.length,
+    title,
+    participantsCount: participants.length,
+    promptLength: purposePrompt.length
+  });
+
+  const startTime = Date.now();
+  const inputTokens = performanceMonitor.estimateTokenCount(purposePrompt);
+
+  try {
+    // Get model with specific configuration for purpose enhancement
+    const model = getGeminiModel({
+      temperature: 0.3, // Slightly creative for better wording
+      maxOutputTokens: 300 // Increased for complex purposes
+    });
+
+    console.log('Calling Gemini for purpose enhancement...');
+    const result = await model.generateContent(purposePrompt);
+
+    const response = await result.response;
+    const content = response.text().trim();
+
+    console.log('Gemini response received:', {
+      contentLength: content.length,
+      contentPreview: content.substring(0, 150) + '...'
+    });
+
+    // Extract token usage from response metadata
+    const usageMetadata = response.usageMetadata;
+    const outputTokens = usageMetadata?.candidatesTokenCount || performanceMonitor.estimateTokenCount(content);
+    const responseTime = Date.now() - startTime;
+
+    // Log successful call with Gemini usage metadata
+    logSuccessfulCall('purpose_enhancement', inputTokens, outputTokens, responseTime, usageMetadata, 'gemini-1.5-flash');
+
+    try {
+      const cleanedContent = cleanJsonResponse(content);
+      console.log('Cleaned JSON response:', cleanedContent.substring(0, 200) + '...');
+
+      const parsed = JSON.parse(cleanedContent);
+
+      const result = {
+        enhancedPurpose: parsed.enhancedPurpose || purpose,
+        keyPoints: Array.isArray(parsed.keyPoints) ? parsed.keyPoints : []
+      };
+
+      console.log('Purpose enhancement successful:', {
+        enhancedPurposeLength: result.enhancedPurpose.length,
+        keyPointsCount: result.keyPoints.length
+      });
+
+      return result;
+    } catch (parseError: any) {
+      console.error('Failed to parse purpose enhancement JSON:', {
+        error: parseError?.message || 'Unknown parse error',
+        rawContent: content,
+        cleanedContent: cleanJsonResponse(content)
+      });
+
+      // Enhanced fallback for JSON parsing errors
+      const fallbackResult = {
+        enhancedPurpose: createFallbackEnhancedPurpose(purpose, title),
+        keyPoints: extractKeyPointsFromPurpose(purpose)
+      };
+
+      console.log('Using fallback for JSON parsing error:', fallbackResult);
+      return fallbackResult;
+    }
+  } catch (error: any) {
+    const responseTime = Date.now() - startTime;
+    const errorMessage = error.message || 'Unknown Gemini API error';
+
+    // Enhanced error logging
+    console.error('Purpose enhancement failed:', {
+      error: errorMessage,
+      purposeLength: purpose.length,
+      title,
+      participantsCount: participants.length,
+      inputTokens,
+      responseTime,
+      errorStatus: error.status,
+      errorCode: error.code
+    });
+
+    // Log failed call
+    logFailedCall('purpose_enhancement', inputTokens, responseTime, errorMessage, 'gemini-1.5-flash');
+
+    // Enhanced fallback for API errors
+    const fallbackResult = {
+      enhancedPurpose: createFallbackEnhancedPurpose(purpose, title),
+      keyPoints: extractKeyPointsFromPurpose(purpose)
+    };
+
+    console.log('Using fallback for API error:', fallbackResult);
+    return fallbackResult;
+  }
+}
+
+// Helper function to create fallback enhanced purpose
+function createFallbackEnhancedPurpose(purpose: string, title: string): string {
+  // Create a more professional version of the original purpose
+  let enhanced = purpose.charAt(0).toUpperCase() + purpose.slice(1);
+
+  // Ensure proper punctuation
+  if (!enhanced.match(/[.!?]$/)) {
+    enhanced += '.';
+  }
+
+  // Add context about the meeting title if it's different from the purpose
+  if (title && title !== purpose && !enhanced.includes(title)) {
+    enhanced = `${title}: ${enhanced}`;
+  }
+
+  return enhanced;
+}
+
+// Helper function to extract key points from purpose
+function extractKeyPointsFromPurpose(purpose: string): string[] {
+  const sentences = purpose.split(/[.!?]+/).filter(s => s.trim().length > 10);
+
+  if (sentences.length === 0) {
+    return [purpose];
+  }
+
+  if (sentences.length <= 3) {
+    return sentences.map(s => s.trim());
+  }
+
+  // Return the most meaningful sentences as key points
+  return sentences.slice(0, 3).map(s => s.trim());
 }
 
 /**

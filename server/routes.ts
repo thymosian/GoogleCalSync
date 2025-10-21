@@ -3,7 +3,8 @@ import { createServer, type Server } from "http";
 import passport from "passport";
 import { storage } from "./storage";
 import { fetchUpcomingEvents, deleteCalendarEvent, createCalendarEvent } from "./googleCalendar";
-import { getGeminiResponse, extractMeetingIntent, generateMeetingTitles, verifyAttendees, generateMeetingAgenda, generateActionItems, type MistralMessage, getContextualResponse } from "./aiInterface.js";
+import { getGeminiResponse, extractMeetingIntent, generateMeetingTitles, enhancePurposeWording, verifyAttendees, generateMeetingAgenda, generateActionItems, type MistralMessage, getContextualResponse } from "./aiInterface.js";
+import { generateResponse as mistralGenerateResponse } from "./mistralService.js";
 import { createEventRequestSchema } from "../shared/schema.js";
 import {
   validateMeetingCreation,
@@ -21,6 +22,108 @@ import { workflowChatIntegration } from "./workflowChatIntegration.js";
 import performanceRoutes from "./routes/performanceRoutes.js";
 import configHealthRoutes from "./routes/configHealth.js";
 import errorReportingRoutes from "./routes/errorReportingRoutes";
+
+
+
+// Helper functions for fallback processing when AI fails
+function generateFallbackTitle(purpose: string): string {
+  if (!purpose || purpose.trim().length === 0) {
+    return "Team Meeting";
+  }
+
+  // Extract meaningful words (nouns, verbs) from the purpose
+  const words = purpose.toLowerCase()
+    .replace(/[^\w\s]/g, '') // Remove punctuation
+    .split(/\s+/)
+    .filter(word => word.length > 3); // Filter out short words
+
+  if (words.length === 0) {
+    return "Team Meeting";
+  }
+
+  // Look for action verbs
+  const actionVerbs = ['discuss', 'review', 'plan', 'analyze', 'create', 'design', 'build', 'develop', 'address', 'resolve', 'implement', 'update', 'organize', 'coordinate', 'schedule'];
+  const action = words.find(word => actionVerbs.includes(word));
+
+  // Get 2-3 key topic words
+  const topicWords = words
+    .filter(w => !actionVerbs.includes(w))
+    .slice(0, 2);
+
+  if (action && topicWords.length > 0) {
+    // Format: "Action Topic Words"
+    const title = [action.charAt(0).toUpperCase() + action.slice(1), ...topicWords.map(w => w.charAt(0).toUpperCase() + w.slice(1))].join(' ');
+    return title.substring(0, 50); // Limit to 50 chars
+  }
+
+  // Fallback: Use first few meaningful words
+  if (topicWords.length > 0) {
+    const title = topicWords.map(w => w.charAt(0).toUpperCase() + w.slice(1)).join(' ');
+    return title.substring(0, 50);
+  }
+
+  return "Team Meeting";
+}
+
+function generateFallbackPurpose(purpose: string): string {
+  // Create a more professional and structured version of the original purpose
+  if (!purpose || purpose.trim().length === 0) {
+    return "Team meeting to discuss important matters.";
+  }
+
+  const sentences = purpose.split(/[.!?]+/).filter(s => s.trim().length > 0);
+
+  if (sentences.length === 0) {
+    return purpose + '.';
+  }
+
+  // Enhance the first sentence and add structure
+  const mainPurpose = sentences[0].trim();
+  let enhanced = mainPurpose.charAt(0).toUpperCase() + mainPurpose.slice(1);
+
+  // Add additional context if there are multiple sentences
+  if (sentences.length > 1) {
+    enhanced += '. ' + sentences.slice(1, 3).join('. ').trim(); // Limit to 3 sentences total
+  }
+
+  // Ensure it ends with proper punctuation
+  if (!enhanced.match(/[.!?]$/)) {
+    enhanced += '.';
+  }
+
+  return enhanced;
+}
+
+function extractFallbackKeyPoints(purpose: string): string[] {
+  if (!purpose || purpose.trim().length === 0) {
+    return ["Discuss agenda", "Review progress", "Plan next steps"];
+  }
+
+  // Split into sentences
+  const sentences = purpose.split(/[.!?]+/)
+    .map(s => s.trim())
+    .filter(s => s.length > 10);
+
+  if (sentences.length === 0) {
+    // Extract key phrases from the purpose text
+    const words = purpose.split(/[\s,;]+/).filter(w => w.length > 3);
+    if (words.length > 0) {
+      return [
+        words.slice(0, 2).join(' '),
+        words.slice(2, 4).join(' ') || "Review details",
+        words.slice(4, 6).join(' ') || "Plan outcomes"
+      ];
+    }
+    return ["Discuss agenda", "Review progress", "Plan next steps"];
+  }
+
+  if (sentences.length <= 3) {
+    return sentences;
+  }
+
+  // Extract the most meaningful sentences as key points
+  return sentences.slice(0, 3);
+}
 
 // Helper functions for UI block rendering
 function getUIBlockPriority(blockType: string): 'high' | 'medium' | 'low' {
@@ -63,7 +166,9 @@ export async function registerRoutes(app: Express): Promise<Server> {
         'profile',
         'email',
         'https://www.googleapis.com/auth/calendar',
-        'https://www.googleapis.com/auth/contacts.readonly'
+        'https://www.googleapis.com/auth/contacts.readonly',
+        'https://www.googleapis.com/auth/gmail.send',
+        'https://www.googleapis.com/auth/gmail.compose'
       ],
       accessType: 'offline',
       prompt: 'consent'
@@ -71,27 +176,36 @@ export async function registerRoutes(app: Express): Promise<Server> {
   });
 
   app.get('/api/auth/google/callback',
-    passport.authenticate('google', {
-      failureRedirect: '/',
-      failureMessage: true
-    }),
+    (req: Request, res: Response, next) => {
+      const timestamp = new Date().toISOString();
+      console.log(`[${timestamp}] OAuth callback route accessed`);
+
+      passport.authenticate('google', {
+        failureRedirect: '/',
+        failureMessage: true
+      })(req, res, next);
+    },
     (req: Request, res: Response) => {
-      console.log('OAuth callback successful, user:', req.user);
+      const timestamp = new Date().toISOString();
+      console.log(`[${timestamp}] OAuth callback successful, user:`, req.user ? (req.user as any).name || (req.user as any).email : 'unknown');
 
       // Set session duration based on remember me preference
       const rememberMe = req.session.rememberMe;
       if (rememberMe) {
         // 30 days for remember me
         req.session.cookie.maxAge = 30 * 24 * 60 * 60 * 1000;
-        console.log('Extended session duration for remember me');
+        console.log(`[${timestamp}] Extended session duration for remember me`);
       } else {
         // 24 hours for regular login
         req.session.cookie.maxAge = 24 * 60 * 60 * 1000;
-        console.log('Standard session duration');
+        console.log(`[${timestamp}] Standard session duration`);
       }
 
       // Clean up the temporary remember me flag
       delete req.session.rememberMe;
+
+      // Clear the last callback time to prevent duplicate processing
+      delete req.session.lastCallbackTime;
 
       // Successful authentication, redirect to dashboard
       res.redirect('/');
@@ -100,8 +214,40 @@ export async function registerRoutes(app: Express): Promise<Server> {
 
   // Add error handling for OAuth failures
   app.get('/api/auth/error', (req: Request, res: Response) => {
-    console.log('OAuth error:', req.flash());
-    res.status(401).json({ error: 'Authentication failed', details: req.flash() });
+    const timestamp = new Date().toISOString();
+    console.log(`[${timestamp}] OAuth error accessed:`, req.flash());
+
+    // Clear any session data that might be corrupted
+    if (req.session) {
+      delete req.session.lastCallbackTime;
+    }
+
+    res.status(401).json({
+      error: 'Authentication failed',
+      details: req.flash(),
+      timestamp,
+      suggestion: 'Please try logging in again. If the problem persists, please contact support.'
+    });
+  });
+
+  // Handle OAuth errors with better error recovery
+  app.use('/api/auth/google/callback', (err: any, req: Request, res: Response, next: any) => {
+    const timestamp = new Date().toISOString();
+    console.error(`[${timestamp}] OAuth callback error:`, err);
+
+    // Clear session data on error
+    if (req.session) {
+      delete req.session.lastCallbackTime;
+    }
+
+    // If it's a TokenError (Bad Request), try to redirect to auth again
+    if (err && err.name === 'TokenError' && err.message === 'Bad Request') {
+      console.log(`[${timestamp}] TokenError detected, redirecting to auth`);
+      return res.redirect('/api/auth/google');
+    }
+
+    // For other errors, redirect to error page
+    res.redirect('/api/auth/error');
   });
 
   app.post('/api/auth/logout', (req: Request, res: Response) => {
@@ -172,6 +318,112 @@ export async function registerRoutes(app: Express): Promise<Server> {
     } catch (error: any) {
       console.error('Error deleting calendar event:', error);
       res.status(500).json({ error: error.message || 'Failed to delete calendar event' });
+    }
+  });
+
+  // Get tasks for current user
+  app.get('/api/tasks', async (req: Request, res: Response) => {
+    if (!req.isAuthenticated()) {
+      return res.status(401).json({ error: 'Not authenticated' });
+    }
+
+    try {
+      const user = req.user as any;
+
+      // Import database and schema
+      const { db } = await import('./storage.js');
+      const { tasks, events } = await import('../shared/schema.js');
+      const { eq } = await import('drizzle-orm');
+
+      // Get all events for the current user
+      const userEvents = await db
+        .select()
+        .from(events)
+        .where(eq(events.userId, user.id));
+
+      if (userEvents.length === 0) {
+        return res.json({ tasks: [] });
+      }
+
+      // Get all tasks for user's events
+      const eventIds = userEvents.map(event => event.id);
+      const eventTasks = await db
+        .select({
+          id: tasks.id,
+          eventId: tasks.eventId,
+          title: tasks.title,
+          description: tasks.description,
+          assignee: tasks.assignee,
+          deadline: tasks.deadline,
+          status: tasks.status,
+          createdAt: tasks.createdAt,
+          eventTitle: events.title,
+          eventStartTime: events.startTime
+        })
+        .from(tasks)
+        .innerJoin(events, eq(tasks.eventId, events.id))
+        .where(eq(events.userId, user.id));
+
+      // Convert to frontend format
+      const formattedTasks = eventTasks.map(task => ({
+        id: task.id,
+        title: task.title,
+        description: task.description,
+        assignee: task.assignee,
+        deadline: task.deadline,
+        status: task.status as 'pending' | 'in_progress' | 'completed',
+        eventTitle: task.eventTitle,
+        eventId: task.eventId,
+        priority: 'medium' as const, // Default priority
+        category: 'general'
+      }));
+
+      res.json({
+        tasks: formattedTasks,
+        totalCount: formattedTasks.length,
+        meetingCount: userEvents.length
+      });
+    } catch (error: any) {
+      console.error('Error fetching tasks:', error);
+      res.status(500).json({ error: error.message || 'Failed to fetch tasks' });
+    }
+  });
+
+  // Update task status
+  app.patch('/api/tasks/:taskId', async (req: Request, res: Response) => {
+    if (!req.isAuthenticated()) {
+      return res.status(401).json({ error: 'Not authenticated' });
+    }
+
+    try {
+      const user = req.user as any;
+      const { taskId } = req.params;
+      const { status } = req.body;
+
+      if (!status || !['pending', 'in_progress', 'completed'].includes(status)) {
+        return res.status(400).json({ error: 'Invalid status' });
+      }
+
+      // Import database and schema
+      const { db } = await import('./storage.js');
+      const { tasks, events } = await import('../shared/schema.js');
+      const { eq } = await import('drizzle-orm');
+
+      // Update task status
+      await db
+        .update(tasks)
+        .set({ status })
+        .where(eq(tasks.id, taskId));
+
+      res.json({
+        success: true,
+        message: 'Task updated successfully',
+        taskId,
+        status
+      });
+    } catch (error: any) {
+      console.error('Error updating task:', error);
+      res.status(500).json({ error: error.message || 'Failed to update task' });
     }
   });
 
@@ -333,15 +585,229 @@ export async function registerRoutes(app: Express): Promise<Server> {
         return res.status(400).json({ error: 'Purpose is required' });
       }
 
+      console.log('Processing purpose with Mistral AI:', purpose);
+
+      // Generate titles using Mistral
       const titleSuggestion = await generateMeetingTitles(
         purpose,
         participants || [],
         context || ''
       );
-      res.json({ titleSuggestion });
+
+      const selectedTitle = titleSuggestion.suggestions[0];
+      console.log('Generated title:', selectedTitle);
+
+      // Enhance purpose using Mistral
+      const purposeEnhancement = await enhancePurposeWording(
+        purpose,
+        selectedTitle,
+        participants || [],
+        context || ''
+      );
+
+      console.log('Enhanced purpose and extracted key points');
+
+      res.json({
+        title: selectedTitle,
+        titleSuggestions: titleSuggestion.suggestions,
+        enhancedPurpose: purposeEnhancement.enhancedPurpose,
+        keyPoints: purposeEnhancement.keyPoints,
+        context: titleSuggestion.context
+      });
     } catch (error: any) {
-      console.error('Error generating meeting titles:', error);
-      res.status(500).json({ error: error.message || 'Failed to generate meeting titles' });
+      console.error('Mistral AI error, attempting fallback:', error);
+
+      try {
+        const { purpose, participants, context } = req.body;
+        
+        // Fallback: Generate with basic processing
+        const fallbackTitle = generateFallbackTitle(purpose);
+        const fallbackPurpose = generateFallbackPurpose(purpose);
+
+        console.log('Using fallback processing');
+
+        res.json({
+          title: fallbackTitle,
+          titleSuggestions: [fallbackTitle, `${fallbackTitle} Discussion`, `${fallbackTitle} Planning`],
+          enhancedPurpose: fallbackPurpose,
+          keyPoints: extractFallbackKeyPoints(purpose),
+          fallback: true,
+          error: error.message
+        });
+      } catch (fallbackError: any) {
+        console.error('Both Mistral and fallback failed:', fallbackError);
+        res.status(500).json({ error: error.message || 'Failed to generate meeting titles and purpose' });
+      }
+    }
+  });
+
+  // AI endpoint for generating title and enhanced purpose together (using Mistral)
+  app.post('/api/ai/generate-title-and-purpose', async (req: Request, res: Response) => {
+    if (!req.isAuthenticated()) {
+      return res.status(401).json({ error: 'Not authenticated' });
+    }
+
+    const { purpose, participants, context } = req.body;
+
+    if (!purpose || typeof purpose !== 'string') {
+      return res.status(400).json({ error: 'Purpose is required' });
+    }
+
+    console.log('Processing purpose with Mistral AI:', purpose);
+
+    try {
+      // Generate titles using Mistral
+      const titleSuggestion = await generateMeetingTitles(
+        purpose,
+        participants || [],
+        context || ''
+      );
+
+      const selectedTitle = titleSuggestion.suggestions[0];
+      console.log('Generated title:', selectedTitle);
+
+      // Enhance purpose using Mistral
+      const purposeEnhancement = await enhancePurposeWording(
+        purpose,
+        selectedTitle,
+        participants || [],
+        context || ''
+      );
+
+      console.log('Mistral AI processing successful:', {
+        title: selectedTitle,
+        enhancedPurpose: purposeEnhancement.enhancedPurpose?.substring(0, 100) + '...',
+        keyPointsCount: purposeEnhancement.keyPoints?.length || 0
+      });
+
+      // Enhanced debug logging for enhanced purpose
+      console.log('Full enhanced purpose:', purposeEnhancement.enhancedPurpose);
+      console.log('Enhanced purpose length:', purposeEnhancement.enhancedPurpose?.length || 0);
+      console.log('Enhanced purpose is empty?', !purposeEnhancement.enhancedPurpose || purposeEnhancement.enhancedPurpose.trim() === '');
+
+      res.json({
+        title: selectedTitle,
+        titleSuggestions: titleSuggestion.suggestions,
+        enhancedPurpose: purposeEnhancement.enhancedPurpose,
+        keyPoints: purposeEnhancement.keyPoints,
+        context: titleSuggestion.context
+      });
+    } catch (error: any) {
+      console.error('Mistral AI error, attempting fallback:', error);
+
+      try {
+        // Fallback: Generate with basic processing
+        const fallbackTitle = generateFallbackTitle(purpose);
+        const fallbackPurpose = generateFallbackPurpose(purpose);
+
+        console.log('Using fallback processing:', fallbackTitle);
+
+        res.json({
+          title: fallbackTitle,
+          titleSuggestions: [fallbackTitle, `${fallbackTitle} Discussion`, `${fallbackTitle} Review`],
+          enhancedPurpose: fallbackPurpose,
+          keyPoints: extractFallbackKeyPoints(purpose),
+          fallback: 'hardcoded',
+          error: error.message
+        });
+      } catch (fallbackError: any) {
+        console.error('Both Mistral and fallback failed:', fallbackError);
+        res.status(500).json({ error: error.message || 'Failed to generate meeting titles and purpose' });
+      }
+    }
+  });
+
+  // AI time extraction endpoint for natural language processing
+  app.post('/api/ai/extract-time', async (req: Request, res: Response) => {
+    if (!req.isAuthenticated()) {
+      return res.status(401).json({ error: 'Not authenticated' });
+    }
+
+    try {
+      const { message, context } = req.body;
+
+      if (!message || typeof message !== 'string') {
+        return res.status(400).json({ error: 'Message is required' });
+      }
+
+      // Import time extractor
+      const { extractTimeFromMessage } = await import('./timeExtractor.js');
+
+      const extractedTime = await extractTimeFromMessage(message, context);
+
+      if (extractedTime) {
+        res.json({
+          startTime: extractedTime.startTime.toISOString(),
+          endTime: extractedTime.endTime?.toISOString(),
+          confidence: extractedTime.confidence,
+          reasoning: extractedTime.reasoning
+        });
+      } else {
+        res.status(400).json({
+          error: 'Could not extract time from message',
+          message: 'Please provide a clearer time description (e.g., "tomorrow at 2pm" or "October 16 at 3:30pm")'
+        });
+      }
+    } catch (error: any) {
+      console.error('Error extracting time:', error);
+      res.status(500).json({ error: error.message || 'Failed to extract time' });
+    }
+  });
+
+  // AI field identification endpoint for "Change Something" workflow
+  app.post('/api/ai/identify-field-to-edit', async (req: Request, res: Response) => {
+    if (!req.isAuthenticated()) {
+      return res.status(401).json({ error: 'Not authenticated' });
+    }
+
+    try {
+      const { message, currentMeeting } = req.body;
+
+      if (!message || typeof message !== 'string') {
+        return res.status(400).json({ error: 'Message is required' });
+      }
+
+      // Use Gemini to identify which field the user wants to edit
+      const prompt = `
+        Based on the user's message: "${message}"
+
+        Current meeting data:
+        ${JSON.stringify(currentMeeting, null, 2)}
+
+        Identify which field the user wants to edit. Possible fields are:
+        - attendees (if they want to add/remove/change attendees)
+        - time (if they want to change the meeting time)
+        - purpose (if they want to change the meeting description/purpose)
+        - title (if they want to change the meeting title)
+        - type (if they want to change meeting type, but this should be rare as it's locked)
+
+        Return a JSON response with:
+        {
+          "field": "field_name_or_null",
+          "confidence": 0.0_to_1.0,
+          "reasoning": "explanation_of_choice"
+        }
+
+        If unsure, return field as null.
+      `;
+
+      const response = await getGeminiResponse([{ role: 'user', content: prompt }]);
+
+      try {
+        // Try to parse the response as JSON
+        const parsedResponse = JSON.parse(response);
+        res.json(parsedResponse);
+      } catch (parseError) {
+        // If parsing fails, return a default response
+        res.json({
+          field: null,
+          confidence: 0.3,
+          reasoning: 'Could not parse AI response'
+        });
+      }
+    } catch (error: any) {
+      console.error('Error identifying field to edit:', error);
+      res.status(500).json({ error: error.message || 'Failed to identify field to edit' });
     }
   });
 
@@ -475,7 +941,7 @@ export async function registerRoutes(app: Express): Promise<Server> {
     }
 
     try {
-      const { meetingData, conversationContext } = req.body;
+      const { meetingData, conversationContext, enhancedPurpose } = req.body;
 
       if (!meetingData) {
         return res.status(400).json({ error: 'Meeting data is required' });
@@ -486,7 +952,8 @@ export async function registerRoutes(app: Express): Promise<Server> {
 
       const agendaContent = await agendaGenerator.generateAgenda(
         meetingData,
-        conversationContext || []
+        conversationContext || [],
+        enhancedPurpose
       );
 
       const formattedAgenda = agendaGenerator.formatAgenda(agendaContent);
@@ -540,29 +1007,851 @@ export async function registerRoutes(app: Express): Promise<Server> {
         return res.status(400).json({ error: 'Template and meeting data are required' });
       }
 
-      const validTemplates = ['standup', 'planning', 'review', 'brainstorm'];
-      if (!validTemplates.includes(template)) {
-        return res.status(400).json({ error: 'Invalid template type' });
+      // Import agenda template service
+      const { agendaTemplateService } = await import('./agendaTemplates.js');
+
+      const templateData = agendaTemplateService.getTemplate(template);
+      if (!templateData) {
+        return res.status(400).json({ error: 'Invalid template ID' });
       }
 
-      // Import agenda generator
+      const formattedAgenda = agendaTemplateService.generateAgendaFromTemplate(template, meetingData);
+
+      // Import agenda generator for validation
       const { agendaGenerator } = await import('./agendaGenerator.js');
-
-      const agendaContent = await agendaGenerator.generateTemplateAgenda(
-        template as 'standup' | 'planning' | 'review' | 'brainstorm',
-        meetingData
-      );
-
-      const formattedAgenda = agendaGenerator.formatAgenda(agendaContent);
+      const validation = agendaGenerator.validateAgenda(formattedAgenda);
 
       res.json({
         agenda: formattedAgenda,
-        agendaContent,
-        validation: agendaGenerator.validateAgenda(formattedAgenda)
+        template: templateData,
+        validation,
+        generatedAt: new Date().toISOString()
       });
     } catch (error: any) {
       console.error('Error generating template agenda:', error);
       res.status(500).json({ error: error.message || 'Failed to generate template agenda' });
+    }
+  });
+
+  // Get all available agenda templates
+  app.get('/api/agenda/templates', async (req: Request, res: Response) => {
+    if (!req.isAuthenticated()) {
+      return res.status(401).json({ error: 'Not authenticated' });
+    }
+
+    try {
+      const { category, search } = req.query;
+
+      // Import agenda template service
+      const { agendaTemplateService } = await import('./agendaTemplates.js');
+
+      let templates;
+      if (search) {
+        templates = agendaTemplateService.searchTemplates(search as string);
+      } else if (category) {
+        templates = agendaTemplateService.getTemplatesByCategory(category as any);
+      } else {
+        templates = agendaTemplateService.getAllTemplates();
+      }
+
+      res.json({
+        templates,
+        totalCount: templates.length,
+        categories: ['standup', 'planning', 'review', 'brainstorm', 'decision', 'training', 'retrospective']
+      });
+    } catch (error: any) {
+      console.error('Error getting agenda templates:', error);
+      res.status(500).json({ error: error.message || 'Failed to get agenda templates' });
+    }
+  });
+
+  // Suggest templates based on meeting purpose
+  app.post('/api/agenda/suggest-templates', async (req: Request, res: Response) => {
+    if (!req.isAuthenticated()) {
+      return res.status(401).json({ error: 'Not authenticated' });
+    }
+
+    try {
+      const { purpose, duration } = req.body;
+
+      if (!purpose) {
+        return res.status(400).json({ error: 'Meeting purpose is required' });
+      }
+
+      // Import agenda template service
+      const { agendaTemplateService } = await import('./agendaTemplates.js');
+
+      const suggestions = agendaTemplateService.suggestTemplates(purpose, duration);
+
+      res.json({
+        suggestions,
+        totalSuggestions: suggestions.length,
+        basedOn: {
+          purpose: purpose.substring(0, 100) + (purpose.length > 100 ? '...' : ''),
+          duration
+        }
+      });
+    } catch (error: any) {
+      console.error('Error suggesting templates:', error);
+      res.status(500).json({ error: error.message || 'Failed to suggest templates' });
+    }
+  });
+
+  // Agenda quality analysis endpoint
+  app.post('/api/agenda/analyze-quality', async (req: Request, res: Response) => {
+    if (!req.isAuthenticated()) {
+      return res.status(401).json({ error: 'Not authenticated' });
+    }
+
+    try {
+      const { content, context } = req.body;
+
+      if (!content || typeof content !== 'string') {
+        return res.status(400).json({ error: 'Agenda content is required' });
+      }
+
+      // Import agenda quality service
+      const { agendaQualityService } = await import('./agendaQualityService.js');
+
+      const qualityReport = agendaQualityService.analyzeQuality(content, context);
+      const improvementSuggestions = agendaQualityService.getImprovementSuggestions(content, context);
+      const minimumValidation = agendaQualityService.validateMinimumQuality(content, context);
+
+      res.json({
+        qualityReport,
+        improvementSuggestions,
+        minimumValidation,
+        analyzedAt: new Date().toISOString()
+      });
+    } catch (error: any) {
+      console.error('Error analyzing agenda quality:', error);
+      res.status(500).json({ error: error.message || 'Failed to analyze agenda quality' });
+    }
+  });
+
+  // Agenda enhancement endpoint
+  app.post('/api/agenda/enhance', async (req: Request, res: Response) => {
+    if (!req.isAuthenticated()) {
+      return res.status(401).json({ error: 'Not authenticated' });
+    }
+
+    try {
+      const { content, context } = req.body;
+
+      if (!content || typeof content !== 'string') {
+        return res.status(400).json({ error: 'Agenda content is required' });
+      }
+
+      // Import agenda quality service
+      const { agendaQualityService } = await import('./agendaQualityService.js');
+
+      const enhancedContent = agendaQualityService.enhanceAgenda(content, context);
+      const qualityReport = agendaQualityService.analyzeQuality(enhancedContent, context);
+
+      res.json({
+        originalContent: content,
+        enhancedContent,
+        qualityReport,
+        improvements: qualityReport.improvements,
+        enhancedAt: new Date().toISOString()
+      });
+    } catch (error: any) {
+      console.error('Error enhancing agenda:', error);
+      res.status(500).json({ error: error.message || 'Failed to enhance agenda' });
+    }
+  });
+
+  // Agenda version management endpoints
+
+  // Get version history for an agenda
+  app.get('/api/agenda/versions/:agendaId', async (req: Request, res: Response) => {
+    if (!req.isAuthenticated()) {
+      return res.status(401).json({ error: 'Not authenticated' });
+    }
+
+    try {
+      const { agendaId } = req.params;
+      const { limit = '20', offset = '0' } = req.query;
+
+      // Import agenda version service
+      const { agendaVersionService } = await import('./agendaVersionService.js');
+
+      const versions = agendaVersionService.getVersions(agendaId);
+      const stats = agendaVersionService.getVersionStats(agendaId);
+
+      // Apply pagination
+      const parsedLimit = Math.min(parseInt(limit as string) || 20, 50);
+      const parsedOffset = Math.max(parseInt(offset as string) || 0, 0);
+      const paginatedVersions = versions.slice(parsedOffset, parsedOffset + parsedLimit);
+
+      res.json({
+        versions: paginatedVersions,
+        stats,
+        pagination: {
+          limit: parsedLimit,
+          offset: parsedOffset,
+          total: versions.length,
+          hasMore: parsedOffset + parsedLimit < versions.length
+        }
+      });
+    } catch (error: any) {
+      console.error('Error getting agenda versions:', error);
+      res.status(500).json({ error: error.message || 'Failed to get agenda versions' });
+    }
+  });
+
+  // Create a new version
+  app.post('/api/agenda/versions/:agendaId', async (req: Request, res: Response) => {
+    if (!req.isAuthenticated()) {
+      return res.status(401).json({ error: 'Not authenticated' });
+    }
+
+    try {
+      const { agendaId } = req.params;
+      const { content, title, changeType, changeDescription, metadata } = req.body;
+      const user = req.user as any;
+
+      if (!content || !title) {
+        return res.status(400).json({ error: 'Content and title are required' });
+      }
+
+      // Import agenda version service
+      const { agendaVersionService } = await import('./agendaVersionService.js');
+
+      const newVersion = agendaVersionService.createVersion(
+        agendaId,
+        content,
+        title,
+        user.id,
+        changeType || 'edited',
+        changeDescription,
+        metadata
+      );
+
+      res.json({
+        version: newVersion,
+        message: 'Version created successfully'
+      });
+    } catch (error: any) {
+      console.error('Error creating agenda version:', error);
+      res.status(500).json({ error: error.message || 'Failed to create agenda version' });
+    }
+  });
+
+  // Compare two versions
+  app.get('/api/agenda/versions/:agendaId/compare', async (req: Request, res: Response) => {
+    if (!req.isAuthenticated()) {
+      return res.status(401).json({ error: 'Not authenticated' });
+    }
+
+    try {
+      const { agendaId } = req.params;
+      const { from, to } = req.query;
+
+      if (!from || !to) {
+        return res.status(400).json({ error: 'From and to version numbers are required' });
+      }
+
+      const fromVersion = parseInt(from as string);
+      const toVersion = parseInt(to as string);
+
+      if (isNaN(fromVersion) || isNaN(toVersion)) {
+        return res.status(400).json({ error: 'Invalid version numbers' });
+      }
+
+      // Import agenda version service
+      const { agendaVersionService } = await import('./agendaVersionService.js');
+
+      const comparison = agendaVersionService.compareVersions(agendaId, fromVersion, toVersion);
+
+      if (!comparison) {
+        return res.status(404).json({ error: 'One or both versions not found' });
+      }
+
+      res.json({
+        comparison,
+        comparedAt: new Date().toISOString()
+      });
+    } catch (error: any) {
+      console.error('Error comparing agenda versions:', error);
+      res.status(500).json({ error: error.message || 'Failed to compare agenda versions' });
+    }
+  });
+
+  // Get latest version
+  app.get('/api/agenda/versions/:agendaId/latest', async (req: Request, res: Response) => {
+    if (!req.isAuthenticated()) {
+      return res.status(401).json({ error: 'Not authenticated' });
+    }
+
+    try {
+      const { agendaId } = req.params;
+
+      // Import agenda version service
+      const { agendaVersionService } = await import('./agendaVersionService.js');
+
+      const latestVersion = agendaVersionService.getLatestVersion(agendaId);
+
+      if (!latestVersion) {
+        return res.status(404).json({ error: 'No versions found for this agenda' });
+      }
+
+      res.json({
+        version: latestVersion
+      });
+    } catch (error: any) {
+      console.error('Error getting latest agenda version:', error);
+      res.status(500).json({ error: error.message || 'Failed to get latest agenda version' });
+    }
+  });
+
+  // Collaborative editing endpoints
+
+  // Create a new collaborative session
+  app.post('/api/collaborative/sessions', async (req: Request, res: Response) => {
+    if (!req.isAuthenticated()) {
+      return res.status(401).json({ error: 'Not authenticated' });
+    }
+
+    try {
+      const { agendaId } = req.body;
+      const user = req.user as any;
+
+      if (!agendaId) {
+        return res.status(400).json({ error: 'Agenda ID is required' });
+      }
+
+      // Import collaborative agenda service
+      const { collaborativeAgendaService } = await import('./collaborativeAgendaService.js');
+
+      const session = collaborativeAgendaService.createSession(
+        agendaId,
+        user.id,
+        user.email,
+        user.name || user.email
+      );
+
+      res.json({
+        session,
+        message: 'Collaborative session created successfully'
+      });
+    } catch (error: any) {
+      console.error('Error creating collaborative session:', error);
+      res.status(500).json({ error: error.message || 'Failed to create collaborative session' });
+    }
+  });
+
+  // Join a collaborative session
+  app.post('/api/collaborative/sessions/:sessionId/join', async (req: Request, res: Response) => {
+    if (!req.isAuthenticated()) {
+      return res.status(401).json({ error: 'Not authenticated' });
+    }
+
+    try {
+      const { sessionId } = req.params;
+      const user = req.user as any;
+
+      // Import collaborative agenda service
+      const { collaborativeAgendaService } = await import('./collaborativeAgendaService.js');
+
+      const collaborator = collaborativeAgendaService.joinSession(
+        sessionId,
+        user.id,
+        user.email,
+        user.name || user.email
+      );
+
+      if (!collaborator) {
+        return res.status(404).json({ error: 'Session not found or inactive' });
+      }
+
+      res.json({
+        collaborator,
+        message: 'Joined collaborative session successfully'
+      });
+    } catch (error: any) {
+      console.error('Error joining collaborative session:', error);
+      res.status(500).json({ error: error.message || 'Failed to join collaborative session' });
+    }
+  });
+
+  // Leave a collaborative session
+  app.post('/api/collaborative/sessions/:sessionId/leave', async (req: Request, res: Response) => {
+    if (!req.isAuthenticated()) {
+      return res.status(401).json({ error: 'Not authenticated' });
+    }
+
+    try {
+      const { sessionId } = req.params;
+      const user = req.user as any;
+
+      // Import collaborative agenda service
+      const { collaborativeAgendaService } = await import('./collaborativeAgendaService.js');
+
+      const success = collaborativeAgendaService.leaveSession(sessionId, user.id);
+
+      if (!success) {
+        return res.status(404).json({ error: 'Session not found or user not in session' });
+      }
+
+      res.json({
+        message: 'Left collaborative session successfully'
+      });
+    } catch (error: any) {
+      console.error('Error leaving collaborative session:', error);
+      res.status(500).json({ error: error.message || 'Failed to leave collaborative session' });
+    }
+  });
+
+  // Get session information
+  app.get('/api/collaborative/sessions/:sessionId', async (req: Request, res: Response) => {
+    if (!req.isAuthenticated()) {
+      return res.status(401).json({ error: 'Not authenticated' });
+    }
+
+    try {
+      const { sessionId } = req.params;
+
+      // Import collaborative agenda service
+      const { collaborativeAgendaService } = await import('./collaborativeAgendaService.js');
+
+      const stats = collaborativeAgendaService.getSessionStats(sessionId);
+
+      if (!stats) {
+        return res.status(404).json({ error: 'Session not found' });
+      }
+
+      res.json(stats);
+    } catch (error: any) {
+      console.error('Error getting session information:', error);
+      res.status(500).json({ error: error.message || 'Failed to get session information' });
+    }
+  });
+
+  // Record an agenda change
+  app.post('/api/collaborative/changes', async (req: Request, res: Response) => {
+    if (!req.isAuthenticated()) {
+      return res.status(401).json({ error: 'Not authenticated' });
+    }
+
+    try {
+      const { sessionId, agendaId, changeType, position, content, length, previousContent, metadata } = req.body;
+      const user = req.user as any;
+
+      if (!sessionId || !agendaId || !changeType || !position) {
+        return res.status(400).json({ error: 'Session ID, agenda ID, change type, and position are required' });
+      }
+
+      // Import collaborative agenda service
+      const { collaborativeAgendaService } = await import('./collaborativeAgendaService.js');
+
+      const change = collaborativeAgendaService.recordChange({
+        sessionId,
+        agendaId,
+        userId: user.id,
+        userName: user.name || user.email,
+        changeType: changeType as any,
+        position,
+        content,
+        length,
+        previousContent,
+        metadata
+      });
+
+      res.json({
+        change,
+        message: 'Change recorded successfully'
+      });
+    } catch (error: any) {
+      console.error('Error recording agenda change:', error);
+      res.status(500).json({ error: error.message || 'Failed to record agenda change' });
+    }
+  });
+
+  // Get recent changes for an agenda
+  app.get('/api/collaborative/agendas/:agendaId/changes', async (req: Request, res: Response) => {
+    if (!req.isAuthenticated()) {
+      return res.status(401).json({ error: 'Not authenticated' });
+    }
+
+    try {
+      const { agendaId } = req.params;
+      const { limit = '50', since } = req.query;
+
+      // Import collaborative agenda service
+      const { collaborativeAgendaService } = await import('./collaborativeAgendaService.js');
+
+      let changes;
+      if (since) {
+        changes = collaborativeAgendaService.getChangesSince(agendaId, new Date(since as string));
+      } else {
+        changes = collaborativeAgendaService.getRecentChanges(agendaId, parseInt(limit as string));
+      }
+
+      res.json({
+        changes,
+        totalCount: changes.length,
+        agendaId
+      });
+    } catch (error: any) {
+      console.error('Error getting agenda changes:', error);
+      res.status(500).json({ error: error.message || 'Failed to get agenda changes' });
+    }
+  });
+
+  // Update cursor position
+  app.post('/api/collaborative/cursor', async (req: Request, res: Response) => {
+    if (!req.isAuthenticated()) {
+      return res.status(401).json({ error: 'Not authenticated' });
+    }
+
+    try {
+      const { sessionId, line, column } = req.body;
+      const user = req.user as any;
+
+      if (!sessionId || line === undefined || column === undefined) {
+        return res.status(400).json({ error: 'Session ID, line, and column are required' });
+      }
+
+      // Import collaborative agenda service
+      const { collaborativeAgendaService } = await import('./collaborativeAgendaService.js');
+
+      const success = collaborativeAgendaService.updateCursor(sessionId, user.id, line, column);
+
+      if (!success) {
+        return res.status(404).json({ error: 'Session not found or user not in session' });
+      }
+
+      res.json({ message: 'Cursor position updated' });
+    } catch (error: any) {
+      console.error('Error updating cursor position:', error);
+      res.status(500).json({ error: error.message || 'Failed to update cursor position' });
+    }
+  });
+
+  // Update text selection
+  app.post('/api/collaborative/selection', async (req: Request, res: Response) => {
+    if (!req.isAuthenticated()) {
+      return res.status(401).json({ error: 'Not authenticated' });
+    }
+
+    try {
+      const { sessionId, startLine, startColumn, endLine, endColumn } = req.body;
+      const user = req.user as any;
+
+      if (!sessionId || startLine === undefined || startColumn === undefined) {
+        return res.status(400).json({ error: 'Session ID, start line, and start column are required' });
+      }
+
+      // Import collaborative agenda service
+      const { collaborativeAgendaService } = await import('./collaborativeAgendaService.js');
+
+      const success = collaborativeAgendaService.updateSelection(
+        sessionId,
+        user.id,
+        startLine,
+        startColumn,
+        endLine ?? startLine,
+        endColumn ?? startColumn
+      );
+
+      if (!success) {
+        return res.status(404).json({ error: 'Session not found or user not in session' });
+      }
+
+      res.json({ message: 'Text selection updated' });
+    } catch (error: any) {
+      console.error('Error updating text selection:', error);
+      res.status(500).json({ error: error.message || 'Failed to update text selection' });
+    }
+  });
+
+  // Acquire a lock on an agenda section
+  app.post('/api/collaborative/locks', async (req: Request, res: Response) => {
+    if (!req.isAuthenticated()) {
+      return res.status(401).json({ error: 'Not authenticated' });
+    }
+
+    try {
+      const { sessionId, agendaId, section } = req.body;
+      const user = req.user as any;
+
+      if (!sessionId || !agendaId || !section) {
+        return res.status(400).json({ error: 'Session ID, agenda ID, and section are required' });
+      }
+
+      // Import collaborative agenda service
+      const { collaborativeAgendaService } = await import('./collaborativeAgendaService.js');
+
+      const lock = collaborativeAgendaService.acquireLock(sessionId, agendaId, section, user.id);
+
+      if (!lock) {
+        return res.status(409).json({ error: 'Section is already locked by another user' });
+      }
+
+      res.json({
+        lock,
+        message: 'Lock acquired successfully'
+      });
+    } catch (error: any) {
+      console.error('Error acquiring lock:', error);
+      res.status(500).json({ error: error.message || 'Failed to acquire lock' });
+    }
+  });
+
+  // Release a lock
+  app.delete('/api/collaborative/locks/:lockId', async (req: Request, res: Response) => {
+    if (!req.isAuthenticated()) {
+      return res.status(401).json({ error: 'Not authenticated' });
+    }
+
+    try {
+      const { lockId } = req.params;
+
+      // Import collaborative agenda service
+      const { collaborativeAgendaService } = await import('./collaborativeAgendaService.js');
+
+      const success = collaborativeAgendaService.releaseLock(lockId);
+
+      if (!success) {
+        return res.status(404).json({ error: 'Lock not found' });
+      }
+
+      res.json({ message: 'Lock released successfully' });
+    } catch (error: any) {
+      console.error('Error releasing lock:', error);
+      res.status(500).json({ error: error.message || 'Failed to release lock' });
+    }
+  });
+
+  // Calendar integration endpoints
+
+  // Get or create sync settings for user
+  app.get('/api/calendar/sync-settings', async (req: Request, res: Response) => {
+    if (!req.isAuthenticated()) {
+      return res.status(401).json({ error: 'Not authenticated' });
+    }
+
+    try {
+      const user = req.user as any;
+
+      // Import calendar agenda sync service
+      const { calendarAgendaSyncService } = await import('./calendarAgendaSyncService.js');
+
+      let settings = calendarAgendaSyncService.getSyncSettings(user.id);
+
+      if (!settings) {
+        settings = calendarAgendaSyncService.createSyncSettings(user.id, {});
+      }
+
+      res.json({ settings });
+    } catch (error: any) {
+      console.error('Error getting sync settings:', error);
+      res.status(500).json({ error: error.message || 'Failed to get sync settings' });
+    }
+  });
+
+  // Update sync settings
+  app.post('/api/calendar/sync-settings', async (req: Request, res: Response) => {
+    if (!req.isAuthenticated()) {
+      return res.status(401).json({ error: 'Not authenticated' });
+    }
+
+    try {
+      const user = req.user as any;
+      const updates = req.body;
+
+      // Import calendar agenda sync service
+      const { calendarAgendaSyncService } = await import('./calendarAgendaSyncService.js');
+
+      const settings = calendarAgendaSyncService.updateSyncSettings(user.id, updates);
+
+      if (!settings) {
+        return res.status(404).json({ error: 'Sync settings not found' });
+      }
+
+      res.json({
+        settings,
+        message: 'Sync settings updated successfully'
+      });
+    } catch (error: any) {
+      console.error('Error updating sync settings:', error);
+      res.status(500).json({ error: error.message || 'Failed to update sync settings' });
+    }
+  });
+
+  // Test calendar connection
+  app.post('/api/calendar/test-connection', async (req: Request, res: Response) => {
+    if (!req.isAuthenticated()) {
+      return res.status(401).json({ error: 'Not authenticated' });
+    }
+
+    try {
+      const user = req.user as any;
+
+      // Import calendar agenda sync service
+      const { calendarAgendaSyncService } = await import('./calendarAgendaSyncService.js');
+
+      const testResult = await calendarAgendaSyncService.testCalendarConnection(user);
+
+      res.json({
+        ...testResult,
+        testedAt: new Date().toISOString()
+      });
+    } catch (error: any) {
+      console.error('Error testing calendar connection:', error);
+      res.status(500).json({ error: error.message || 'Failed to test calendar connection' });
+    }
+  });
+
+  // Get relevant calendar events for agenda sync
+  app.get('/api/calendar/relevant-events', async (req: Request, res: Response) => {
+    if (!req.isAuthenticated()) {
+      return res.status(401).json({ error: 'Not authenticated' });
+    }
+
+    try {
+      const user = req.user as any;
+      const { agendaId } = req.query;
+
+      // Import calendar agenda sync service
+      const { calendarAgendaSyncService } = await import('./calendarAgendaSyncService.js');
+
+      const events = await calendarAgendaSyncService.getRelevantCalendarEvents(user, agendaId as string);
+
+      res.json({
+        events,
+        totalCount: events.length,
+        retrievedAt: new Date().toISOString()
+      });
+    } catch (error: any) {
+      console.error('Error getting relevant calendar events:', error);
+      res.status(500).json({ error: error.message || 'Failed to get relevant calendar events' });
+    }
+  });
+
+  // Sync agenda to calendar
+  app.post('/api/calendar/sync-agenda', async (req: Request, res: Response) => {
+    if (!req.isAuthenticated()) {
+      return res.status(401).json({ error: 'Not authenticated' });
+    }
+
+    try {
+      const { agendaContent, meetingData, calendarEventId } = req.body;
+      const user = req.user as any;
+
+      if (!agendaContent || !meetingData) {
+        return res.status(400).json({ error: 'Agenda content and meeting data are required' });
+      }
+
+      // Import calendar agenda sync service
+      const { calendarAgendaSyncService } = await import('./calendarAgendaSyncService.js');
+
+      // Queue the update for sync
+      const update = calendarAgendaSyncService.queueAgendaUpdate(
+        meetingData.id || `agenda_${Date.now()}`,
+        calendarEventId || meetingData.calendarEventId,
+        user.id,
+        'updated',
+        [
+          {
+            field: 'agenda',
+            oldValue: meetingData.previousAgenda || '',
+            newValue: agendaContent
+          }
+        ]
+      );
+
+      // Perform the sync
+      const syncResult = await calendarAgendaSyncService.syncToCalendar(user, agendaContent, meetingData);
+
+      res.json({
+        syncResult,
+        update,
+        syncedAt: new Date().toISOString()
+      });
+    } catch (error: any) {
+      console.error('Error syncing agenda to calendar:', error);
+      res.status(500).json({ error: error.message || 'Failed to sync agenda to calendar' });
+    }
+  });
+
+  // Get sync statistics
+  app.get('/api/calendar/sync-stats', async (req: Request, res: Response) => {
+    if (!req.isAuthenticated()) {
+      return res.status(401).json({ error: 'Not authenticated' });
+    }
+
+    try {
+      const user = req.user as any;
+
+      // Import calendar agenda sync service
+      const { calendarAgendaSyncService } = await import('./calendarAgendaSyncService.js');
+
+      const stats = calendarAgendaSyncService.getSyncStats(user.id);
+
+      res.json({
+        ...stats,
+        retrievedAt: new Date().toISOString()
+      });
+    } catch (error: any) {
+      console.error('Error getting sync statistics:', error);
+      res.status(500).json({ error: error.message || 'Failed to get sync statistics' });
+    }
+  });
+
+  // Force sync all pending updates
+  app.post('/api/calendar/force-sync', async (req: Request, res: Response) => {
+    if (!req.isAuthenticated()) {
+      return res.status(401).json({ error: 'Not authenticated' });
+    }
+
+    try {
+      const { agendaContent, meetingData } = req.body;
+      const user = req.user as any;
+
+      if (!agendaContent || !meetingData) {
+        return res.status(400).json({ error: 'Agenda content and meeting data are required' });
+      }
+
+      // Import calendar agenda sync service
+      const { calendarAgendaSyncService } = await import('./calendarAgendaSyncService.js');
+
+      const syncResult = await calendarAgendaSyncService.forceSync(user, agendaContent, meetingData);
+
+      res.json({
+        syncResult,
+        forcedAt: new Date().toISOString()
+      });
+    } catch (error: any) {
+      console.error('Error force syncing to calendar:', error);
+      res.status(500).json({ error: error.message || 'Failed to force sync to calendar' });
+    }
+  });
+
+  // Clean up old sync updates
+  app.post('/api/calendar/cleanup', async (req: Request, res: Response) => {
+    if (!req.isAuthenticated()) {
+      return res.status(401).json({ error: 'Not authenticated' });
+    }
+
+    try {
+      const user = req.user as any;
+      const { olderThanDays = 30 } = req.body;
+
+      // Import calendar agenda sync service
+      const { calendarAgendaSyncService } = await import('./calendarAgendaSyncService.js');
+
+      const removedCount = calendarAgendaSyncService.cleanupOldUpdates(user.id, olderThanDays);
+
+      res.json({
+        message: `Cleaned up ${removedCount} old sync updates`,
+        removedCount,
+        cleanedAt: new Date().toISOString()
+      });
+    } catch (error: any) {
+      console.error('Error cleaning up sync updates:', error);
+      res.status(500).json({ error: error.message || 'Failed to clean up sync updates' });
     }
   });
 
@@ -1091,7 +2380,7 @@ export async function registerRoutes(app: Express): Promise<Server> {
         title: finalMeetingData.title,
         startTime: finalMeetingData.startTime,
         endTime: finalMeetingData.endTime,
-        description: finalMeetingData.agenda || '',
+        description: (finalMeetingData as any).enhancedPurpose || finalMeetingData.agenda || '',
         attendees: finalMeetingData.attendees?.map((a: any) => ({
           email: a.email,
           name: a.firstName ? `${a.firstName} ${a.lastName || ''}`.trim() : undefined,
@@ -1153,10 +2442,14 @@ export async function registerRoutes(app: Express): Promise<Server> {
 
         const eventData = validationResult.data;
 
+        // Use enhanced purpose if available, otherwise fall back to original description
+        const requestBody = req.body as any;
+        const description = requestBody.enhancedPurpose || eventData.description || '';
+
         // Create the calendar event with optional Meet link
         const createdEvent = await createCalendarEvent(
           user,
-          eventData,
+          { ...eventData, description },
           eventData.createMeetLink ? 'online' : 'physical'
         );
 
@@ -1170,6 +2463,56 @@ export async function registerRoutes(app: Express): Promise<Server> {
         // Add validation warnings if they exist
         if (req.validationResult?.warnings && req.validationResult.warnings.length > 0) {
           response.warnings = req.validationResult.warnings;
+        }
+
+        // Initiate transcript workflow after successful meeting creation
+        try {
+          const { MeetingWorkflowOrchestrator } = await import('./meetingWorkflowOrchestrator.js');
+          const { createConversationContextEngine } = await import('./conversationContext.js');
+          const contextEngine = await createConversationContextEngine({} as any);
+          const businessRules = new BusinessRulesEngine();
+          const attendeeValidator = new AttendeeValidator();
+
+          const workflowOrchestrator = new MeetingWorkflowOrchestrator(
+            contextEngine,
+            businessRules,
+            attendeeValidator,
+            user
+          );
+
+          // Create meeting data for transcript workflow
+          const meetingData = {
+            id: createdEvent.id || `meeting-${Date.now()}`,
+            title: eventData.title,
+            type: (eventData.createMeetLink ? 'online' : 'physical') as 'online' | 'physical',
+            startTime: new Date(eventData.startTime),
+            endTime: new Date(eventData.endTime),
+            attendees: eventData.attendees?.map((a: any) => ({
+              email: a.email,
+              firstName: a.name?.split(' ')[0],
+              lastName: a.name?.split(' ').slice(1).join(' '),
+              isValidated: true,
+              isRequired: true
+            })) || [],
+            agenda: description,
+            meetingLink: createdEvent.meetingLink,
+            status: 'created' as const
+          };
+
+          // Initiate transcript workflow asynchronously (don't wait for it)
+          workflowOrchestrator.initiateTranscriptWorkflow(
+            createdEvent.id || `meeting-${Date.now()}`,
+            meetingData,
+            user
+          ).catch((transcriptError: any) => {
+            console.error('Error initiating transcript workflow:', transcriptError);
+            // Don't fail the meeting creation for transcript errors
+          });
+
+          console.log(`📋 Transcript workflow initiated for meeting: ${createdEvent.id}`);
+        } catch (transcriptError) {
+          console.error('Error setting up transcript workflow:', transcriptError);
+          // Don't fail the meeting creation for transcript setup errors
         }
 
         res.json(response);
@@ -1369,7 +2712,8 @@ export async function registerRoutes(app: Express): Promise<Server> {
       // Regenerate agenda with conversation context
       const agendaContent = await agendaGenerator.generateAgenda(
         meetingData,
-        conversationContext || []
+        conversationContext || [],
+        (meetingData as any).enhancedPurpose
       );
 
       const formattedAgenda = agendaGenerator.formatAgenda(agendaContent);
@@ -1486,6 +2830,766 @@ export async function registerRoutes(app: Express): Promise<Server> {
     } catch (error: any) {
       console.error('Error getting current agenda:', error);
       res.status(500).json({ error: error.message || 'Failed to get current agenda' });
+    }
+  });
+
+  // Generate agenda endpoint for streamlined workflow
+  app.post('/api/meetings/generate-agenda', async (req: Request, res: Response) => {
+    if (!req.isAuthenticated()) {
+      return res.status(401).json({ error: 'Not authenticated' });
+    }
+
+    try {
+      const { meetingId, title, purpose, enhancedPurpose, participants, duration, meetingLink } = req.body;
+
+      if (!title || !purpose) {
+        return res.status(400).json({ error: 'Title and purpose are required' });
+      }
+
+      // Import agenda generator
+      const { agendaGenerator } = await import('./agendaGenerator.js');
+
+      // Create meeting data structure for agenda generation
+      const meetingData = {
+        id: meetingId,
+        title,
+        description: enhancedPurpose || purpose,
+        attendees: participants.map((email: string) => ({
+          email,
+          isValidated: true,
+          isRequired: true,
+          firstName: email.split('@')[0]
+        })),
+        type: 'online' as const,
+        status: 'draft' as const,
+        startTime: new Date(),
+        endTime: new Date(Date.now() + (duration || 60) * 60 * 1000)
+      };
+
+      // Generate agenda
+      const agendaContent = await agendaGenerator.generateAgenda(
+        meetingData,
+        [],
+        enhancedPurpose
+      );
+      const formattedAgenda = agendaGenerator.formatAgenda(agendaContent);
+
+      res.json({
+        success: true,
+        agenda: {
+          title,
+          duration: duration || 60,
+          topics: agendaContent.topics || [],
+          actionItems: agendaContent.actionItems || [],
+          enhancedPurpose: enhancedPurpose
+        }
+      });
+
+    } catch (error: any) {
+      console.error('Error generating agenda:', error);
+      res.status(500).json({ error: error.message || 'Failed to generate agenda' });
+    }
+  });
+
+  // Helper function to validate AI response completeness - much more lenient
+  function validateAgendaResponse(response: string, title: string, enhancedPurpose: string): boolean {
+    console.log('🔍 Validating agenda response:', {
+      length: response.length,
+      hasTitle: response.includes(title.substring(0, 20)),
+      hasH2: response.includes('<h2>'),
+      hasH3: response.includes('<h3>'),
+      hasContent: response.includes('<p>') || response.includes('<ul>') || response.includes('<li>')
+    });
+
+    // Basic requirements - if these fail, reject
+    if (!response || response.length < 200) {
+      console.warn('❌ Response too short:', response.length, 'characters');
+      return false;
+    }
+
+    if (!response.includes('<h2>')) {
+      console.warn('❌ Response missing main heading');
+      return false;
+    }
+
+    if (!response.includes(title.substring(0, 20))) {
+      console.warn('❌ Response missing meeting title');
+      return false;
+    }
+
+    // Check for obviously truncated content
+    if (response.endsWith('<') || response.endsWith('&') || response.endsWith('<b>') || response.endsWith('<s') || response.endsWith('<')) {
+      console.warn('❌ Response appears to be truncated');
+      return false;
+    }
+
+    // Check for severely mismatched HTML tags
+    const openTags = (response.match(/<\w+/g) || []).length;
+    const closeTags = (response.match(/<\/\w+/g) || []).length;
+    const tagDifference = Math.abs(openTags - closeTags);
+
+    if (tagDifference > 15) { // Very high tolerance
+      console.warn('❌ Response has severely mismatched HTML tags:', { openTags, closeTags, difference: tagDifference });
+      return false;
+    }
+
+    // If we get here, the response is probably good enough
+    console.log('✅ Agenda response accepted (lenient validation):', {
+      length: response.length,
+      hasBasicStructure: response.includes('<h2>') && (response.includes('<p>') || response.includes('<ul>') || response.includes('<li>'))
+    });
+
+    return true;
+  }
+
+  // Helper function to validate narrative response completeness - very lenient due to quota limits
+  function validateNarrativeResponse(response: string, title: string, enhancedPurpose: string): boolean {
+    console.log('🔍 Validating narrative response:', {
+      length: response.length,
+      wordCount: response.split(' ').length,
+      hasTitle: response.toLowerCase().includes(title.split(' ').slice(0, 2).join(' ').toLowerCase()),
+      hasPurpose: response.toLowerCase().includes(enhancedPurpose.substring(0, 30).toLowerCase())
+    });
+
+    // Basic requirements - if these fail, reject
+    if (!response || response.length < 80) {
+      console.warn('❌ Narrative response too short:', response.length, 'characters');
+      return false;
+    }
+
+    // Check if response is properly formatted (should be plain text, no HTML tags)
+    if (response.includes('<h2>') || response.includes('<p>') || response.includes('<div>') || response.includes('<html>')) {
+      console.warn('❌ Narrative response contains HTML tags, should be plain text');
+      return false;
+    }
+
+    // Check if response contains the title or purpose keywords
+    const titleWords = title.split(' ').slice(0, 2).join(' ').toLowerCase();
+    const purposeWords = enhancedPurpose.substring(0, 50).toLowerCase();
+
+    if (!response.toLowerCase().includes(titleWords) && !response.toLowerCase().includes(purposeWords.substring(0, 20))) {
+      console.warn('❌ Narrative response missing key meeting information');
+      return false;
+    }
+
+    // Check for obviously truncated content indicators
+    if (response.endsWith('...') && response.length < 150) {
+      console.warn('❌ Narrative response appears to be truncated');
+      return false;
+    }
+
+    // Very relaxed punctuation check - only reject if it ends very abruptly
+    const trimmedResponse = response.trim();
+    if (trimmedResponse.length > 0 && trimmedResponse.length < 200 && !trimmedResponse.match(/[.!?]$/)) {
+      console.warn('⚠️ Narrative response may not end with punctuation, but accepting anyway due to quota limits');
+    }
+
+    // Check for minimum word count for narrative content (reduced from 30 to 20)
+    const wordCount = response.split(' ').length;
+    if (wordCount < 20) {
+      console.warn('❌ Narrative response too short for meaningful content:', wordCount, 'words');
+      return false;
+    }
+
+    console.log('✅ Narrative response accepted (very lenient validation):', {
+      length: response.length,
+      wordCount: wordCount,
+      hasKeyInfo: response.toLowerCase().includes(titleWords) || response.toLowerCase().includes(purposeWords.substring(0, 20))
+    });
+
+    return true;
+  }
+
+  // Helper function to generate comprehensive fallback agenda content - improved to match AI format
+  function generateFallbackAgendaContent(title: string, enhancedPurpose: string, duration: number = 60, meetingLink?: string): string {
+    const introTime = Math.ceil((duration || 60) * 0.1);
+    const discussionTime = Math.ceil((duration || 60) * 0.6);
+    const decisionTime = Math.ceil((duration || 60) * 0.15);
+    const actionTime = Math.ceil((duration || 60) * 0.15);
+
+    return `
+      <h2>Meeting Agenda: ${title}</h2>
+      <p><strong>Duration:</strong> ${duration || 60} minutes</p>
+
+      <h3>1. Professional Introduction (${introTime} minutes)</h3>
+      <ul>
+        <li>Welcome and context setting</li>
+        <li>Meeting objectives overview</li>
+        <li>Participant roles and expectations</li>
+      </ul>
+
+      <h3>2. Core Discussion Topics (${discussionTime} minutes)</h3>
+      <ul>
+        <li><strong>Topic Analysis:</strong> Review key objectives and challenges from the meeting purpose</li>
+        <li><strong>Problem Identification:</strong> Address specific issues mentioned in the enhanced purpose</li>
+        <li><strong>Solution Development:</strong> Brainstorm and evaluate approaches to resolve identified challenges</li>
+        <li><strong>Decision Making:</strong> Build consensus on next steps and action plans</li>
+      </ul>
+
+      <h3>3. Decision Points & Problem Solving (${decisionTime} minutes)</h3>
+      <ul>
+        <li>Identify specific decisions that need to be made based on the meeting purpose</li>
+        <li>Address any problems or challenges mentioned</li>
+        <li>Discuss solutions and approaches</li>
+        <li>Build consensus on implementation plans</li>
+      </ul>
+
+      <h3>4. Action Items & Accountability (${actionTime} minutes)</h3>
+      <ul>
+        <li>Specific deliverables and outcomes expected from this meeting</li>
+        <li>Responsible parties for follow-up actions</li>
+        <li>Timeline for completion with specific deadlines</li>
+        <li>Success metrics and KPIs relevant to the meeting purpose</li>
+      </ul>
+
+      <h3>5. Meeting Link and Logistics</h3>
+      <ul>
+        <li><strong>Meeting Link:</strong> ${meetingLink ? `<a href="${meetingLink}">${meetingLink}</a>` : 'TBD'}</li>
+        <li>Technical requirements and preparation needed</li>
+        <li>Contact information for technical issues</li>
+        <li>Any pre-reading or preparation required</li>
+      </ul>
+
+      <h3>6. Professional Closing (${Math.ceil((duration || 60) * 0.1)} minutes)</h3>
+      <ul>
+        <li>Summary of key decisions and action items</li>
+        <li>Next steps and follow-up timeline</li>
+        <li>Thank you and Q&A</li>
+      </ul>
+
+      <p><em>Please come prepared with relevant data and be ready to contribute to the discussion.</em></p>
+    `;
+  }
+
+  // Helper function to generate simple narrative content when AI is unavailable
+  function generateSimpleNarrativeContent(title: string, enhancedPurpose: string, duration: number = 60, meetingLink?: string, participants?: string[]): string {
+    const participantCount = participants?.length || 0;
+
+    return `Meeting: ${title}
+
+Purpose: ${enhancedPurpose}
+
+Duration: ${duration} minutes
+Participants: ${participantCount} attendees
+
+This meeting brings together key team members to address important aspects of our current projects and processes. Participants will discuss challenges, share insights, and develop actionable solutions.
+
+Expected outcomes include:
+• Clear action items and responsibilities
+• Timeline for implementation
+• Next steps for follow-up
+
+${meetingLink ? `Join the meeting at: ${meetingLink}` : ''}
+
+All participants are encouraged to come prepared and contribute to the discussion.`;
+  }
+
+  // Helper function to generate fallback narrative content
+  function generateFallbackNarrativeContent(title: string, enhancedPurpose: string, duration?: number, meetingLink?: string, participants?: string[]): string {
+    const participantCount = participants?.length || 0;
+    const durationText = duration ? `${duration} minutes` : 'the scheduled time';
+
+    return `This meeting, titled "${title}", brings together ${participantCount} key participants to address critical aspects of ${enhancedPurpose.toLowerCase()}. The session is designed to last ${durationText} and represents an important opportunity for collaborative problem-solving and strategic alignment.
+
+The meeting focuses on identifying core challenges and opportunities within our current processes, with particular attention to how we can improve efficiency and outcomes. Participants will engage in detailed discussions about the specific issues at hand, drawing on their expertise and experience to develop actionable solutions.
+
+By bringing together diverse perspectives and areas of expertise, this meeting aims to foster innovative thinking and build consensus around the best path forward. The collaborative environment will encourage open dialogue and creative problem-solving, ensuring that all voices are heard and valuable insights are captured.
+
+Expected outcomes include clear action items, assigned responsibilities, and a shared understanding of next steps. The meeting will also establish mechanisms for tracking progress and maintaining accountability as we move forward with implementation.
+
+${meetingLink ? `Participants should use the provided meeting link (${meetingLink}) to join the session.` : 'Meeting access details will be provided separately.'} All participants are encouraged to come prepared with relevant data, examples, and ideas to contribute to the discussion.`;
+  }
+
+  // Enhanced agenda generation for Step 7 workflow
+  app.post('/api/meetings/generate-rich-agenda', async (req: Request, res: Response) => {
+    if (!req.isAuthenticated()) {
+      return res.status(401).json({ error: 'Not authenticated' });
+    }
+
+    try {
+      const { meetingId, title, enhancedPurpose, participants, duration, meetingLink, startTime, endTime } = req.body;
+
+      if (!title || !enhancedPurpose) {
+        return res.status(400).json({ error: 'Title and enhanced purpose are required' });
+      }
+
+      // Import caching service
+      const { cachingService } = await import('./cachingService.js');
+
+      // Create cache key for this agenda generation request
+      const meetingData = { id: meetingId, title, enhancedPurpose, attendees: participants, startTime, endTime };
+      const cacheKey = cachingService.generateAgendaCacheKey(meetingData);
+
+      // Check cache first
+      const cachedAgenda = cachingService.get(cacheKey);
+      if (cachedAgenda) {
+        console.log('Returning cached agenda for meeting:', title);
+        return res.json({
+          success: true,
+          agenda: cachedAgenda,
+          cached: true,
+          generatedAt: new Date().toISOString()
+        });
+      }
+
+      // Generate detailed, comprehensive agenda using AI - optimized for ReactQuill compatibility
+      const agendaPrompt = `
+        Create a complete, detailed meeting agenda in HTML format for:
+
+        MEETING TITLE: "${title}"
+        ENHANCED PURPOSE: "${enhancedPurpose}"
+        DURATION: ${duration || 60} minutes
+        PARTICIPANTS: ${participants?.length || 0} attendees
+
+        REQUIRED AGENDA STRUCTURE - Create all 5 sections:
+
+        1. INTRODUCTION SECTION (5 minutes)
+           - Welcome and agenda overview
+           - Meeting objectives from the enhanced purpose
+           - Participant expectations and ground rules
+
+        2. MAIN DISCUSSION SECTION (35 minutes)
+           - Break down the enhanced purpose into 3-4 specific discussion topics
+           - Each topic should have 2-3 bullet points
+           - Include time allocation for each topic
+           - Connect topics directly to the enhanced purpose
+
+        3. DECISION MAKING SECTION (10 minutes)
+           - Identify specific decisions needed based on the enhanced purpose
+           - Discuss challenges and solutions
+           - Build consensus on next steps
+
+        4. ACTION ITEMS SECTION (5 minutes)
+           - Specific deliverables and outcomes
+           - Responsible parties and deadlines
+           - Success metrics and follow-up
+
+        5. MEETING LINK AND LOGISTICS (5 minutes)
+           - Meeting link: ${meetingLink || 'TBD'}
+           - Technical requirements and preparation
+           - Contact information and Q&A
+
+        CRITICAL FORMATTING REQUIREMENTS:
+        - Return ONLY valid HTML FRAGMENT (no markdown, no \`\`\`html, no <html>/<body> tags)
+        - Start directly with: <h2>Meeting Agenda: ${title}</h2>
+        - Use <h3> for all section headings
+        - Use <p> for all paragraphs and text content
+        - Use <ul> and <li> for bullet points (no dashes or asterisks)
+        - Use <strong> for bold text, <em> for italics
+        - Include time allocations like <strong>(10 minutes)</strong>
+        - Ensure total time equals ${duration || 60} minutes
+        - End with meeting link in a separate paragraph
+
+        QUALITY REQUIREMENTS:
+        - Every section must be comprehensive and detailed
+        - All content must directly relate to the enhanced purpose
+        - Include specific, actionable discussion points
+        - Ensure smooth flow between sections
+        - Make it professional and well-structured
+        - Aim for 600-800 words total
+      `;
+
+      const messages = [
+        {
+          role: 'system',
+          content: 'You are a professional meeting facilitator and agenda specialist. Create detailed, comprehensive agendas that ensure productive and well-structured meetings. You MUST return ONLY valid HTML FRAGMENT content with NO markdown, NO code blocks, NO backticks, NO ```html, NO <html>, <head>, or <body> tags. Start directly with <h2> and use proper HTML fragment tags throughout. Return pure HTML fragments only.'
+        },
+        {
+          role: 'user',
+          content: agendaPrompt
+        }
+      ];
+
+      const { getGeminiResponse } = await import('./aiInterface.js');
+
+      // Function to validate and retry AI responses
+      const generateWithRetry = async (retryCount = 0): Promise<string> => {
+        const maxRetries = 3;
+        const response = await getGeminiResponse(messages);
+
+        console.log(`📝 AI Response attempt ${retryCount + 1}:`, {
+          length: response.length,
+          startsWith: response.substring(0, 50),
+          endsWith: response.substring(response.length - 50),
+          hasHtml: response.includes('<html>'),
+          hasH2: response.includes('<h2>'),
+          hasClosingTag: response.includes('</')
+        });
+
+        // Validate response completeness
+        const isComplete = validateAgendaResponse(response, title, enhancedPurpose);
+        const isProperLength = response.length > 500; // Minimum expected length for agenda
+
+        if (isComplete && isProperLength) {
+          console.log('✅ AI response is complete and valid');
+          return response;
+        }
+
+        if (retryCount < maxRetries) {
+          console.warn(`⚠️ AI response incomplete (attempt ${retryCount + 1}/${maxRetries + 1}), retrying...`);
+          console.warn('Response issues:', {
+            isComplete,
+            isProperLength,
+            actualLength: response.length,
+            hasTitle: response.includes(title.substring(0, 20))
+          });
+
+          // Wait before retry with exponential backoff
+          await new Promise(resolve => setTimeout(resolve, 1000 * Math.pow(2, retryCount)));
+          return generateWithRetry(retryCount + 1);
+        }
+
+        console.error('❌ AI response failed validation after all retries, using fallback');
+        return generateFallbackAgendaContent(title, enhancedPurpose, duration, meetingLink);
+      };
+
+      const richAgendaHtml = await generateWithRetry();
+
+      // Final validation
+      let finalHtmlContent = richAgendaHtml;
+      if (!finalHtmlContent || finalHtmlContent.length < 200) {
+        console.warn('AI returned very short content, using comprehensive fallback');
+        finalHtmlContent = generateFallbackAgendaContent(title, enhancedPurpose, duration, meetingLink);
+      }
+
+      // Also generate a plain text version for editing
+      const plainTextPrompt = agendaPrompt.replace(/HTML/g, 'plain text').replace(/<[^>]*>/g, '');
+      const plainTextMessages = [
+        {
+          role: 'system',
+          content: 'You are a professional meeting facilitator. Create detailed, comprehensive agendas in plain text format with clear structure and actionable content.'
+        },
+        {
+          role: 'user',
+          content: plainTextPrompt
+        }
+      ];
+
+      const richAgendaText = await getGeminiResponse(plainTextMessages);
+
+      const agendaResult = {
+        html: finalHtmlContent,
+        text: richAgendaText,
+        title,
+        duration: duration || 60,
+        meetingLink,
+        enhancedPurpose,
+        wordCount: richAgendaText.split(' ').length,
+        estimatedReadingTime: Math.ceil(richAgendaText.split(' ').length / 200) // Assume 200 words per minute
+      };
+
+      // Cache the successful result
+      cachingService.set(cacheKey, agendaResult, 30 * 60 * 1000); // Cache for 30 minutes
+
+      res.json({
+        success: true,
+        agenda: agendaResult,
+        cached: false,
+        generatedAt: new Date().toISOString()
+      });
+
+    } catch (error: any) {
+      console.error('Error generating rich agenda:', error);
+      res.status(500).json({ error: error.message || 'Failed to generate rich agenda' });
+    }
+  });
+
+  // Generate narrative description endpoint
+  app.post('/api/meetings/generate-narrative-description', async (req: Request, res: Response) => {
+    if (!req.isAuthenticated()) {
+      return res.status(401).json({ error: 'Not authenticated' });
+    }
+
+    try {
+      const { meetingId, title, enhancedPurpose, participants, duration, meetingLink, startTime, endTime } = req.body;
+
+      if (!title || !enhancedPurpose) {
+        return res.status(400).json({ error: 'Title and enhanced purpose are required' });
+      }
+
+      // Import caching service
+      const { cachingService } = await import('./cachingService.js');
+
+      // Create cache key for this narrative description request
+      const meetingData = { id: meetingId, title, enhancedPurpose, attendees: participants, startTime, endTime };
+      const cacheKey = `narrative_description_${meetingId}_${title.substring(0, 20)}`;
+
+      // Check cache first
+      const cachedDescription = cachingService.get(cacheKey);
+      if (cachedDescription) {
+        console.log('Returning cached narrative description for meeting:', title);
+        return res.json({
+          success: true,
+          narrativeDescription: cachedDescription,
+          cached: true,
+          generatedAt: new Date().toISOString()
+        });
+      }
+
+      // Generate detailed narrative description using AI - optimized for better completion
+      const narrativePrompt = `
+        Write a professional narrative meeting description for:
+
+        Title: "${title}"
+        Purpose: "${enhancedPurpose}"
+        Duration: ${duration || 60} minutes
+        Attendees: ${participants?.length || 0}
+
+        Write a cohesive narrative paragraph (150-250 words) that explains:
+        - Why this meeting is necessary and important
+        - What participants will accomplish together
+        - How it connects to broader organizational goals
+        - Expected outcomes and value for attendees
+
+        Use professional, engaging language. Write in complete sentences and end with appropriate punctuation. Focus on the meeting's purpose and benefits.
+      `;
+
+      const messages = [
+        {
+          role: 'system',
+          content: 'You are a professional business writer who specializes in creating clear, engaging, and informative meeting descriptions. Your writing is concise yet comprehensive, with a warm professional tone that motivates readers to participate actively in meetings.'
+        },
+        {
+          role: 'user',
+          content: narrativePrompt
+        }
+      ];
+
+      // Function to generate narrative with improved retry logic
+      const generateNarrativeWithRetry = async (retryCount = 0): Promise<string> => {
+        const maxRetries = 3;
+
+        try {
+          console.log(`📝 Generating narrative description (attempt ${retryCount + 1}/${maxRetries + 1})...`);
+          const response = await getGeminiResponse(messages);
+
+          console.log(`📝 Narrative Response attempt ${retryCount + 1}:`, {
+            length: response.length,
+            wordCount: response.split(' ').length,
+            startsWith: response.substring(0, 50),
+            endsWith: response.substring(response.length - 50),
+            hasProperEnding: /[.!?]$/.test(response)
+          });
+
+          // Validate narrative response with improved checks
+          const isComplete = validateNarrativeResponse(response, title, enhancedPurpose);
+          const isProperLength = response.length > 200 && response.split(' ').length > 60;
+
+          if (isComplete && isProperLength) {
+            console.log('✅ Narrative response is complete and valid');
+            return response;
+          }
+
+          // If response is too short but has content, it might be truncated
+          if (response.length > 100 && response.length < 200) {
+            console.warn(`⚠️ Narrative response seems truncated (length: ${response.length}), retrying...`);
+          } else if (!isComplete) {
+            console.warn(`⚠️ Narrative response incomplete (attempt ${retryCount + 1}/${maxRetries + 1}), retrying...`);
+          }
+
+          if (retryCount < maxRetries) {
+            // Progressive delay with jitter to avoid thundering herd
+            const delay = 1000 + (Math.random() * 500) + (retryCount * 500);
+            console.log(`⏳ Waiting ${Math.round(delay)}ms before retry...`);
+            await new Promise(resolve => setTimeout(resolve, delay));
+            return generateNarrativeWithRetry(retryCount + 1);
+          }
+
+          console.error('❌ Narrative response failed validation after all retries, using fallback');
+          const fallbackDuration = duration || 60;
+          return generateFallbackNarrativeContent(title, enhancedPurpose, fallbackDuration, meetingLink, participants);
+
+        } catch (error: any) {
+          console.error(`❌ Error in narrative generation attempt ${retryCount + 1}:`, error.message);
+
+          if (retryCount < maxRetries) {
+            const delay = 1000 + (Math.random() * 500) + (retryCount * 500);
+            console.log(`⏳ Retrying after error, waiting ${Math.round(delay)}ms...`);
+            await new Promise(resolve => setTimeout(resolve, delay));
+            return generateNarrativeWithRetry(retryCount + 1);
+          }
+
+          // Use fallback for any error after all retries
+          console.error('❌ Narrative generation failed completely, using fallback');
+          const fallbackDuration = duration || 60;
+          return generateFallbackNarrativeContent(title, enhancedPurpose, fallbackDuration, meetingLink, participants);
+        }
+      };
+
+      let narrativeDescription: string;
+
+      try {
+        console.log('🚀 Starting narrative description generation...');
+        narrativeDescription = await generateNarrativeWithRetry();
+        console.log('✅ Narrative description generated successfully');
+
+        // Final validation and cleanup
+        if (narrativeDescription.length < 150) {
+          console.warn('⚠️ Generated narrative too short, using fallback');
+          const fallbackDuration = duration || 60;
+          narrativeDescription = generateFallbackNarrativeContent(title, enhancedPurpose, fallbackDuration, meetingLink, participants);
+        }
+
+        // Clean up any unwanted formatting
+        narrativeDescription = narrativeDescription
+          .replace(/\*\*/g, '') // Remove bold markdown
+          .replace(/\*/g, '')   // Remove italic markdown
+          .replace(/`/g, '')    // Remove code markdown
+          .trim();
+
+        console.log('📝 Final narrative description:', {
+          length: narrativeDescription.length,
+          wordCount: narrativeDescription.split(' ').length,
+          preview: narrativeDescription.substring(0, 100) + '...'
+        });
+
+      } catch (error: any) {
+        console.error('❌ Narrative generation failed completely:', error.message);
+
+        // Use appropriate fallback based on error type
+        if (error.message.includes('quota') || error.message.includes('rate limit') || error.message.includes('429')) {
+          console.warn('🤖 AI quota exceeded, using simple fallback narrative');
+          const fallbackDuration = duration || 60;
+          narrativeDescription = generateSimpleNarrativeContent(title, enhancedPurpose, fallbackDuration, meetingLink, participants);
+        } else if (error.message.includes('timeout') || error.message.includes('network')) {
+          console.warn('🌐 Network/AI timeout, using comprehensive fallback');
+          const fallbackDuration = duration || 60;
+          narrativeDescription = generateFallbackNarrativeContent(title, enhancedPurpose, fallbackDuration, meetingLink, participants);
+        } else {
+          console.warn('💥 Unexpected error, using comprehensive fallback');
+          const fallbackDuration = duration || 60;
+          narrativeDescription = generateFallbackNarrativeContent(title, enhancedPurpose, fallbackDuration, meetingLink, participants);
+        }
+      }
+
+      // Ensure we always have a valid narrative description
+      if (!narrativeDescription || narrativeDescription.length < 100) {
+        console.error('🚨 Narrative description still too short after all fallbacks, using emergency fallback');
+        narrativeDescription = `This meeting titled "${title}" focuses on ${enhancedPurpose.toLowerCase()}. It brings together key participants to discuss important matters and make decisions that will impact our work. The meeting is scheduled for ${duration || 60} minutes and represents an important opportunity for collaboration and alignment. Participants are encouraged to come prepared and contribute to the discussion.`;
+      }
+
+    } catch (error: any) {
+      console.error('Error generating narrative description:', error);
+      res.status(500).json({ error: error.message || 'Failed to generate narrative description' });
+    }
+  });
+
+  // Send agenda endpoint for streamlined workflow
+  app.post('/api/meetings/send-agenda', async (req: Request, res: Response) => {
+    if (!req.isAuthenticated()) {
+      return res.status(401).json({ error: 'Not authenticated' });
+    }
+
+    try {
+      const { meetingId, formattedAgenda, attendees, title, startTime, endTime, meetingLink } = req.body;
+      const user = req.user as any;
+
+      // Validate required fields
+      if (!meetingId || !formattedAgenda) {
+        return res.status(400).json({ error: 'Meeting ID and formatted agenda HTML are required' });
+      }
+
+      if (!attendees || !Array.isArray(attendees) || attendees.length === 0) {
+        return res.status(400).json({ error: 'At least one attendee email is required' });
+      }
+
+      console.log('Processing send-agenda request:', {
+        meetingId,
+        attendeeCount: attendees.length,
+        title: title || 'Meeting',
+        hasAgendaContent: !!formattedAgenda
+      });
+
+      // Import email workflow orchestrator and attendee validator
+      const { emailWorkflowOrchestrator } = await import('./emailWorkflowOrchestrator.js');
+      const { attendeeValidator } = await import('./attendeeValidator.js');
+
+      // Validate attendee emails
+      console.log('Validating attendee emails...');
+      const validatedAttendees = await Promise.all(
+        attendees.map(async (email: string) => {
+          try {
+            const result = await attendeeValidator.validateEmail(email, user);
+            console.log(`Email validation for ${email}:`, result.isValid);
+            return result;
+          } catch (error) {
+            console.warn(`Failed to validate email ${email}:`, error);
+            // Return basic validation result if validation fails
+            return {
+              email,
+              isValid: /^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(email),
+              exists: false,
+              isGoogleUser: false
+            };
+          }
+        })
+      );
+
+      const validEmailCount = validatedAttendees.filter((a: any) => a.isValid).length;
+      if (validEmailCount === 0) {
+        return res.status(400).json({ error: 'No valid attendee emails provided' });
+      }
+
+      // Create meeting data structure for the email
+      const meetingData = {
+        id: meetingId,
+        title: title || 'Meeting Agenda',
+        description: 'Please find the meeting agenda below',
+        attendees: validatedAttendees,
+        type: 'online' as const,
+        startTime: startTime ? new Date(startTime) : undefined,
+        endTime: endTime ? new Date(endTime) : undefined,
+        meetingLink
+      };
+
+      // Create agenda content structure that matches AgendaContent interface
+      const agendaContent = {
+        title: title || 'Meeting Agenda',
+        duration: startTime && endTime
+          ? Math.round((new Date(endTime).getTime() - new Date(startTime).getTime()) / (1000 * 60))
+          : 60,
+        topics: [
+          {
+            title: 'Meeting Overview',
+            duration: startTime && endTime
+              ? Math.round((new Date(endTime).getTime() - new Date(startTime).getTime()) / (1000 * 60))
+              : 60,
+            description: 'Complete meeting agenda and discussion points'
+          }
+        ],
+        actionItems: [],
+        enhancedPurpose: formattedAgenda
+      };
+
+      // CRITICAL FIX: Actually start the email sending workflow
+      console.log('Starting email workflow for agenda distribution...');
+      const jobId = await emailWorkflowOrchestrator.startEmailSendingWorkflow(
+        user,
+        meetingId,
+        validatedAttendees,
+        meetingData,
+        agendaContent
+      );
+
+      console.log('Email sending workflow started successfully:', {
+        jobId,
+        validEmailCount
+      });
+
+      // Return success with job details
+      res.json({
+        success: true,
+        message: 'Agenda will be sent to attendees',
+        result: {
+          jobId,
+          totalRecipients: validEmailCount,
+          status: 'processing'
+        }
+      });
+
+    } catch (error: any) {
+      console.error('Error sending agenda emails:', error);
+      res.status(500).json({ error: error.message || 'Failed to send agenda emails' });
     }
   });
 

@@ -5,7 +5,7 @@
 
 import { db } from './storage';
 import { performanceMonitor } from './performanceMonitor';
-import { cacheManager } from './cachingService';
+import { cachingService } from './cachingService';
 import type { ConversationContext, ChatMessage, MeetingDraft } from '../shared/schema';
 
 export interface QueryOptions {
@@ -35,12 +35,6 @@ export interface QueryPerformanceMetrics {
  * Database query optimizer with caching and performance monitoring
  */
 export class DatabaseOptimizer {
-  private queryCache = cacheManager.getCache<any>('databaseQueries', {
-    ttl: 2 * 60 * 1000, // 2 minutes
-    maxSize: 1000,
-    enableMetrics: true
-  });
-
   private queryMetrics = {
     queryCount: 0,
     totalExecutionTime: 0,
@@ -73,7 +67,7 @@ export class DatabaseOptimizer {
     try {
       // Try cache first if enabled
       if (opts.useCache) {
-        const cached = this.queryCache.get(queryKey);
+        const cached = cachingService.get(queryKey);
         if (cached !== null) {
           this.queryMetrics.cacheHits++;
           const executionTime = Date.now() - startTime;
@@ -94,7 +88,7 @@ export class DatabaseOptimizer {
 
       // Cache result if enabled
       if (opts.useCache) {
-        this.queryCache.set(queryKey, result, opts.cacheTtl);
+        cachingService.set(queryKey, result, opts.cacheTtl);
       }
 
       // Record metrics
@@ -347,12 +341,12 @@ export class DatabaseOptimizer {
     ];
 
     // Find and delete all keys that start with these patterns
-    const allStats = this.queryCache.getStats();
+    const allStats = cachingService.getStats();
     // Note: This is a simplified implementation. In a real scenario,
     // you'd need to track keys more systematically
     keysToInvalidate.forEach(pattern => {
       // This would need a more sophisticated key tracking mechanism
-      this.queryCache.delete(pattern);
+      cachingService.delete(pattern);
     });
   }
 
@@ -367,7 +361,7 @@ export class DatabaseOptimizer {
     ];
 
     keysToInvalidate.forEach(key => {
-      this.queryCache.delete(key);
+      cachingService.delete(key);
     });
   }
 

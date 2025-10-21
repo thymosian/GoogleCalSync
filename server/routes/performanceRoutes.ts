@@ -4,7 +4,7 @@
 
 import { Router } from 'express';
 import { performanceDashboard } from '../performanceDashboard';
-import { cacheManager } from '../cachingService';
+import { cachingService } from '../cachingService';
 import { databaseOptimizer } from '../databaseOptimizer';
 import { performanceMonitor } from '../performanceMonitor';
 import { attendeeValidator } from '../attendeeValidator';
@@ -101,7 +101,7 @@ router.post('/alerts/:id/resolve', async (req, res) => {
  */
 router.get('/cache/stats', async (req, res) => {
   try {
-    const allStats = cacheManager.getAllStats();
+    const allStats = cachingService.getStats();
     const attendeeStats = attendeeValidator.getCacheStats();
     const conversationStats = conversationStorage.getQueryPerformanceMetrics();
     
@@ -125,7 +125,7 @@ router.post('/cache/clear', async (req, res) => {
     const { cacheType } = req.body;
     
     if (cacheType === 'all' || !cacheType) {
-      cacheManager.clearAll();
+      cachingService.clear();
       attendeeValidator.clearCache();
       conversationStorage.clearCaches();
       databaseOptimizer.clearCaches();
@@ -196,8 +196,18 @@ router.get('/ai/stats', async (req, res) => {
 router.get('/recommendations', async (req, res) => {
   try {
     const aiRecommendations = performanceMonitor.getOptimizationRecommendations();
-    const cacheRecommendations = cacheManager.getOptimizationRecommendations();
+    const cacheStats = cachingService.getStats();
     const dbRecommendations = databaseOptimizer.getOptimizationRecommendations();
+    
+    // Generate basic cache recommendations
+    const cacheRecommendations: any[] = [];
+    if (cacheStats.size > 500) {
+      cacheRecommendations.push({
+        priority: 'medium',
+        description: 'Cache is accumulating entries',
+        suggestedAction: 'Run cache cleanup to remove expired entries'
+      });
+    }
     
     res.json({
       ai: aiRecommendations,

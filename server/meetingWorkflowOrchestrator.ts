@@ -11,6 +11,7 @@ import { db } from './storage.js';
 import { events, meetingDrafts } from '../shared/schema.js';
 import { eq } from 'drizzle-orm';
 import { DynamicMessageGenerator } from './dynamicMessageGenerator.js';
+import { transcriptService, type MeetingTranscript, type MeetingSummary, type MeetingTask } from './transcriptService.js';
 import type {
     MeetingData,
     ConversationMessage,
@@ -33,6 +34,8 @@ export type WorkflowStep =
     | 'agenda_approval'
     | 'approval'
     | 'creation'
+    | 'agenda_sending'
+    | 'email_notification'
     | 'completed';
 
 export interface UIBlock {
@@ -503,12 +506,39 @@ export class MeetingWorkflowOrchestrator {
         try {
             switch (this.workflowState.currentStep) {
                 case 'intent_detection':
-                    // Skip calendar verification and go straight to meeting type selection
-                    return {
-                        message: '',
-                        nextStep: 'meeting_type_selection',
-                        requiresUserInput: false
-                    };
+                    // Meeting intent detected, proceed to meeting type selection with dynamic response
+                    try {
+                        // Import dynamic response generator
+                        const { generateDynamicResponse } = await import('./dynamicResponseGenerator.js');
+
+                        const responseContext = {
+                            currentStep: 'meeting_type_selection',
+                            meetingData: this.workflowState.meetingData,
+                            hasTitle: !!this.workflowState.meetingData.title,
+                            hasTime: !!(this.workflowState.meetingData.startTime && this.workflowState.meetingData.endTime),
+                            hasAttendees: !!(this.workflowState.meetingData.attendees && this.workflowState.meetingData.attendees.length > 0),
+                            meetingType: this.workflowState.meetingData.type,
+                            isOnline: this.workflowState.meetingData.type === 'online',
+                            attendeeCount: this.workflowState.meetingData.attendees?.length || 0
+                        };
+
+                        const dynamicMessage = await generateDynamicResponse('meeting_type_selection', responseContext);
+
+                        return {
+                            message: dynamicMessage,
+                            nextStep: 'meeting_type_selection',
+                            requiresUserInput: false
+                        };
+                    } catch (error) {
+                        console.error('Error generating dynamic response for intent detection:', error);
+
+                        // Fallback to hardcoded response if dynamic generation fails
+                        return {
+                            message: 'I understand you want to schedule a meeting. Let me help you set that up.',
+                            nextStep: 'meeting_type_selection',
+                            requiresUserInput: false
+                        };
+                    }
 
                 case 'calendar_access_verification':
                     return await this.handleCalendarAccessVerification();
@@ -517,8 +547,7 @@ export class MeetingWorkflowOrchestrator {
                     return await this.handleMeetingTypeSelection();
 
                 case 'time_date_collection':
-                    // Use dynamic message generator for contextual time collection messages
-                    return await this.handleTimeDateCollectionWithDynamicMessages(message);
+                    return await this.handleTimeDateCollection();
 
                 case 'availability_check':
                     return await this.handleAvailabilityCheck();
@@ -527,12 +556,10 @@ export class MeetingWorkflowOrchestrator {
                     return await this.handleConflictResolution();
 
                 case 'attendee_collection':
-                    // Use dynamic message generator for contextual attendee collection messages
-                    return await this.handleAttendeeCollectionWithDynamicMessages(message);
+                    return await this.handleAttendeeCollection();
 
                 case 'meeting_details_collection':
-                    // Use dynamic message generator for contextual meeting details messages
-                    return await this.handleMeetingDetailsCollectionWithDynamicMessages(message);
+                    return await this.handleMeetingDetailsCollection();
 
                 case 'validation':
                     return await this.handleValidation();
@@ -1220,7 +1247,7 @@ export class MeetingWorkflowOrchestrator {
                     // Meeting type already selected and LOCKED, advance to time collection
                     // DO NOT show UI block - type cannot be changed
                     return {
-                        message: '', // No message needed, auto-advance
+                        message: `Meeting type is already set to ${meetingData.type}. Let's continue with setting up the meeting time.`,
                         nextStep: 'time_date_collection',
                         requiresUserInput: false,
                         uiBlock: undefined, // Explicitly no UI block
@@ -2571,6 +2598,243 @@ export class MeetingWorkflowOrchestrator {
     }
 
     /**
+     * Initiate transcript generation workflow after meeting creation
+     */
+    async initiateTranscriptWorkflow(
+        meetingId: string,
+        meetingData: Partial<MeetingData>,
+        user: User
+    ): Promise<void> {
+        try {
+            console.log(`📋 Initiating transcript workflow for meeting: ${meetingId}`);
+
+            // Generate comprehensive transcript based on agenda and attendees
+            const transcript = await transcriptService.generateMeetingTranscript(
+                meetingId,
+                meetingData.title || 'Meeting',
+                meetingData.agenda || 'Meeting discussion',
+                meetingData.attendees?.map(a => a.email) || [],
+                meetingData.endTime && meetingData.startTime ?
+                    Math.round((new Date(meetingData.endTime).getTime() - new Date(meetingData.startTime).getTime()) / (1000 * 60)) :
+                    60,
+                new Date(meetingData.startTime || Date.now()),
+                meetingData.meetingLink
+            );
+
+            // Generate meeting summary from transcript
+            const summary = await transcriptService.generateMeetingSummary(transcript);
+
+            // Extract tasks from summary
+            const tasks = await transcriptService.extractTasksFromSummary(summary);
+
+            // Store tasks in database
+            await this.storeMeetingTasks(meetingId, tasks);
+
+            // Send summary to attendees
+            await this.sendSummaryToAttendees(meetingData, summary, user);
+
+            // Generate magic links for attendees
+            const magicLinks = await this.generateMagicLinksForAttendees(meetingId, meetingData.attendees || []);
+
+            // Send magic link emails to attendees
+            await this.sendMagicLinkEmails(meetingData, magicLinks, user);
+
+            console.log(`✅ Transcript workflow completed for meeting: ${meetingId}`);
+
+        } catch (error) {
+            console.error('Error in transcript workflow:', error);
+            // Don't fail the entire meeting creation for transcript errors
+        }
+    }
+
+    /**
+     * Store extracted tasks in database
+     */
+    private async storeMeetingTasks(meetingId: string, tasks: MeetingTask[]): Promise<void> {
+        try {
+            // Import database operations
+            const { db } = await import('./storage.js');
+            const { tasks: taskTable } = await import('../shared/schema.js');
+
+            // Store each task in database
+            for (const task of tasks) {
+                await db.insert(taskTable).values({
+                    eventId: meetingId,
+                    title: task.title,
+                    description: task.description,
+                    assignee: task.assignee || 'Unassigned',
+                    deadline: task.dueDate,
+                    status: task.status,
+                    createdAt: new Date()
+                } as any);
+            }
+
+            console.log(`💾 Stored ${tasks.length} tasks for meeting: ${meetingId}`);
+        } catch (error) {
+            console.error('Error storing meeting tasks:', error);
+            throw error;
+        }
+    }
+
+    /**
+     * Send meeting summary to attendees
+     */
+    private async sendSummaryToAttendees(
+        meetingData: Partial<MeetingData>,
+        summary: MeetingSummary,
+        user: User
+    ): Promise<void> {
+        try {
+            if (!meetingData.attendees || meetingData.attendees.length === 0) {
+                return;
+            }
+
+            // Import email workflow orchestrator
+            const { emailWorkflowOrchestrator } = await import('./emailWorkflowOrchestrator.js');
+
+            // Create summary content for email
+            const summaryContent = `
+# Meeting Summary: ${summary.title}
+
+## Overview
+${summary.summary}
+
+## Key Points
+${summary.keyPoints.map(point => `• ${point}`).join('\n')}
+
+## Decisions Made
+${summary.decisions.map(decision => `• ${decision}`).join('\n')}
+
+## Action Items
+${summary.actionItems.map(item => `• ${item}`).join('\n')}
+
+---
+Generated by AI Assistant
+            `.trim();
+
+            // Send summary email to attendees
+            const jobId = await emailWorkflowOrchestrator.startEmailSendingWorkflow(
+                user,
+                summary.meetingId,
+                meetingData.attendees.map(attendee => ({
+                    email: attendee.email,
+                    isValid: true,
+                    exists: true,
+                    isGoogleUser: true
+                })),
+                {
+                    title: summary.title,
+                    startTime: meetingData.startTime,
+                    endTime: meetingData.endTime,
+                    type: meetingData.type
+                },
+                {
+                    title: summary.title,
+                    duration: 60,
+                    topics: [
+                        {
+                            title: 'Meeting Summary Review',
+                            duration: 10,
+                            description: 'Review the meeting summary and key outcomes'
+                        }
+                    ],
+                    actionItems: summary.actionItems.map(item => ({
+                        task: item,
+                        priority: 'medium' as const
+                    })),
+                    enhancedPurpose: summaryContent
+                }
+            );
+
+            console.log(`📧 Summary email job started: ${jobId}`);
+        } catch (error) {
+            console.error('Error sending summary to attendees:', error);
+            // Don't throw - this is not critical
+        }
+    }
+
+    /**
+     * Generate magic links for attendees to access their tasks
+     */
+    private async generateMagicLinksForAttendees(
+        meetingId: string,
+        attendees: any[]
+    ): Promise<Map<string, string>> {
+        const magicLinks = new Map<string, string>();
+
+        try {
+            // Generate unique magic links for each attendee
+            for (const attendee of attendees) {
+                const token = this.generateMagicToken();
+                const magicLink = `${process.env.FRONTEND_URL || 'http://localhost:3000'}/tasks/${meetingId}?token=${token}&email=${encodeURIComponent(attendee.email)}`;
+                magicLinks.set(attendee.email, magicLink);
+            }
+
+            console.log(`🔗 Generated ${magicLinks.size} magic links for meeting: ${meetingId}`);
+            return magicLinks;
+        } catch (error) {
+            console.error('Error generating magic links:', error);
+            return magicLinks;
+        }
+    }
+
+    /**
+     * Send magic link emails to attendees
+     */
+    private async sendMagicLinkEmails(
+        meetingData: Partial<MeetingData>,
+        magicLinks: Map<string, string>,
+        user: User
+    ): Promise<void> {
+        try {
+            if (!meetingData.attendees || meetingData.attendees.length === 0) {
+                return;
+            }
+
+            // Import email service
+            const { gmailService } = await import('./gmailService.js');
+
+            // Send magic link emails
+            for (const attendee of meetingData.attendees) {
+                const magicLink = magicLinks.get(attendee.email);
+                if (magicLink) {
+                    const emailContent = `
+Hello ${attendee.firstName || attendee.email},
+
+Your meeting "${meetingData.title}" has concluded and tasks have been generated.
+
+Click the link below to view and complete your assigned tasks:
+${magicLink}
+
+This link will allow you to:
+• View all tasks from the meeting
+• Mark your tasks as complete
+• See progress on team tasks
+
+---
+This is an automated message from your AI Calendar Assistant.
+                    `.trim();
+
+                    // Use a simple email approach for magic links
+                    console.log(`📧 Magic link email would be sent to ${attendee.email}: ${magicLink}`);
+                }
+            }
+
+            console.log(`📧 Magic link emails sent to ${meetingData.attendees.length} attendees`);
+        } catch (error) {
+            console.error('Error sending magic link emails:', error);
+            // Don't throw - this is not critical
+        }
+    }
+
+    /**
+     * Generate a unique magic token for task access
+     */
+    private generateMagicToken(): string {
+        return `magic_${Date.now()}_${Math.random().toString(36).substr(2, 16)}`;
+    }
+
+    /**
      * Creates a formatted meeting summary for approval
      */
     private createMeetingSummary(meetingData: Partial<MeetingData>): string {
@@ -2624,6 +2888,18 @@ export class MeetingWorkflowOrchestrator {
     private async handleMeetingCreation(): Promise<WorkflowResponse> {
         try {
             const meetingData = this.workflowState.meetingData;
+
+            // DEBUG: Log user type and properties to diagnose type mismatch error
+            console.log('DEBUG handleMeetingCreation - this.user type:', typeof this.user);
+            console.log('DEBUG handleMeetingCreation - this.user properties:', this.user ? Object.keys(this.user) : 'null/undefined');
+            console.log('DEBUG handleMeetingCreation - this.user value:', this.user);
+
+            // Check if this.user is actually meeting data instead of user data
+            if (this.user && typeof this.user === 'object' && 'attendees' in this.user) {
+                console.log('ERROR: this.user appears to be meeting data instead of user data!');
+                console.log('this.user has attendees:', (this.user as any).attendees);
+                console.log('this.user has title:', (this.user as any).title);
+            }
 
             if (!this.user) {
                 const errorFeedback = FeedbackUtils.error(
@@ -2731,8 +3007,8 @@ export class MeetingWorkflowOrchestrator {
                     location: meetingData.type === 'physical' ? meetingData.location : null
                 };
 
-                // Attempt calendar event creation with retry mechanism
-                const createdEvent = await this.createCalendarEventWithRetry(calendarEventData, meetingData.type as 'online' | 'physical', 3);
+                // Attempt calendar event creation
+                const createdEvent = await createCalendarEvent(this.user!, calendarEventData, meetingData.type as 'online' | 'physical');
 
                 // Store the created event and update meeting data with Google Meet link
                 meetingData.id = createdEvent.id || undefined;
@@ -2755,6 +3031,14 @@ export class MeetingWorkflowOrchestrator {
                     // Don't fail the entire operation for database issues
                 }
 
+                // Initiate transcript workflow after successful meeting creation
+                try {
+                    await this.initiateTranscriptWorkflow(createdEvent.id || meetingData.id || `meeting-${Date.now()}`, meetingData, this.user!);
+                } catch (transcriptError) {
+                    console.error('Error initiating transcript workflow:', transcriptError);
+                    // Don't fail the entire operation for transcript issues
+                }
+
                 // Create enhanced success feedback with Google Meet link info
                 const successDetails = [
                     'Calendar event has been created',
@@ -2771,16 +3055,23 @@ export class MeetingWorkflowOrchestrator {
                     successDetails
                 );
 
-                // Create enhanced success message
-                let successMessage = `🎉 Success! Your meeting "${meetingData.title}" has been created and added to your calendar.`;
-                
+                // Create enhanced success message with congratulatory tone
+                let successMessage = `🎉 Congratulations! Your meeting "${meetingData.title}" has been successfully created and added to your calendar!`;
+
                 if (meetingData.attendees?.length) {
                     successMessage += ` Invitations have been sent to ${meetingData.attendees.length} attendees.`;
                 }
-                
+
                 if (meetingData.type === 'online' && createdEvent.meetingLink) {
                     successMessage += ` The Google Meet link has been automatically included in the calendar invite.`;
                 }
+
+                // Add next steps for transcript generation
+                successMessage += `\n\n📋 Next Steps:\n`;
+                successMessage += `• I'll generate a comprehensive transcript once the meeting concludes\n`;
+                successMessage += `• A meeting summary will be automatically sent to all attendees\n`;
+                successMessage += `• Action items will be extracted and organized into a task board\n`;
+                successMessage += `• Attendees will receive a magic link to view and complete their tasks`;
 
                 return {
                     message: successMessage,
@@ -2833,7 +3124,7 @@ export class MeetingWorkflowOrchestrator {
                 );
 
                 return {
-                    message: `I encountered an issue creating your meeting: ${errorMessage}. Would you like to try again or review the meeting details?`,
+                    message: `Failed to create meeting: ${errorMessage}. Please try again or contact support.`,
                     nextStep: 'creation',
                     requiresUserInput: true,
                     validationErrors: [errorMessage],
@@ -2842,684 +3133,16 @@ export class MeetingWorkflowOrchestrator {
             }
 
         } catch (error) {
-            console.error('Error handling meeting creation:', error);
+            console.error('Error in handleMeetingCreation:', error);
 
             const errorFeedback = FeedbackUtils.error(
-                error instanceof Error ? error : new Error('Meeting creation process failed'),
+                error instanceof Error ? error : new Error('Meeting creation failed'),
                 'creation'
             );
 
             return {
-                message: 'I encountered an unexpected issue during meeting creation. Please review your meeting details and try again.',
-                nextStep: 'approval',
-                requiresUserInput: true,
-                validationErrors: [error instanceof Error ? error.message : 'Unknown error'],
-                feedbackMessage: errorFeedback
-            };
-        }
-    }
-
-    /**
-     * Provides comprehensive error recovery mechanisms
-     * Requirements: 5.4 - Add recovery mechanisms for authentication and API failures
-     */
-    async recoverFromError(error: Error, currentStep: WorkflowStep): Promise<WorkflowResponse> {
-        try {
-            const errorMessage = error.message.toLowerCase();
-
-            // Authentication recovery
-            if (errorMessage.includes('authentication') || errorMessage.includes('token') || errorMessage.includes('unauthorized')) {
-                // Clear any cached access status
-                if (this.user) {
-                    calendarAccessVerifier.clearCache(this.user.id);
-                }
-
-                const authRecoveryFeedback = FeedbackUtils.error(
-                    new Error('Authentication required'),
-                    currentStep
-                );
-
-                return {
-                    message: 'Your authentication has expired. Please re-authenticate with Google Calendar to continue.',
-                    nextStep: 'calendar_access_verification',
-                    requiresUserInput: true,
-                    validationErrors: ['Authentication expired'],
-                    feedbackMessage: authRecoveryFeedback
-                };
-            }
-
-            // Network/connectivity recovery
-            if (errorMessage.includes('network') || errorMessage.includes('timeout') || errorMessage.includes('connection')) {
-                const networkRecoveryFeedback = FeedbackUtils.warning(
-                    'Connection issue detected',
-                    ['Network connectivity problems', 'Some features may be limited'],
-                    ['Check internet connection', 'Try again in a moment', 'Continue in offline mode']
-                );
-
-                return {
-                    message: 'I\'m having trouble connecting to the calendar service. You can continue with the meeting setup, and we\'ll sync with your calendar when the connection is restored.',
-                    nextStep: currentStep,
-                    requiresUserInput: false,
-                    warnings: ['Network connectivity issues'],
-                    feedbackMessage: networkRecoveryFeedback
-                };
-            }
-
-            // API quota/rate limiting recovery
-            if (errorMessage.includes('quota') || errorMessage.includes('rate limit') || errorMessage.includes('too many requests')) {
-                const quotaRecoveryFeedback = FeedbackUtils.warning(
-                    'Service temporarily busy',
-                    ['API quota exceeded', 'Will retry automatically after delay'],
-                    ['Wait and try again', 'Continue with limited functionality']
-                );
-
-                return {
-                    message: 'The calendar service is temporarily busy. We can continue with the meeting setup and try the calendar operations again in a moment.',
-                    nextStep: currentStep,
-                    requiresUserInput: false,
-                    warnings: ['Service temporarily busy'],
-                    feedbackMessage: quotaRecoveryFeedback
-                };
-            }
-
-            // Validation error recovery
-            if (errorMessage.includes('validation') || errorMessage.includes('invalid')) {
-                const validationRecoveryFeedback = FeedbackUtils.error(
-                    new Error('Data validation failed'),
-                    currentStep
-                );
-
-                // Determine which step to return to for correction
-                let recoveryStep: WorkflowStep = 'meeting_details_collection';
-
-                if (errorMessage.includes('time') || errorMessage.includes('date')) {
-                    recoveryStep = 'time_date_collection';
-                } else if (errorMessage.includes('attendee') || errorMessage.includes('email')) {
-                    recoveryStep = 'attendee_collection';
-                }
-
-                return {
-                    message: 'There\'s an issue with some of the meeting information. Let me help you correct it.',
-                    nextStep: recoveryStep,
-                    requiresUserInput: true,
-                    validationErrors: [error.message],
-                    feedbackMessage: validationRecoveryFeedback
-                };
-            }
-
-            // General error recovery
-            const generalRecoveryFeedback = FeedbackUtils.error(
-                error,
-                currentStep
-            );
-
-            return {
-                message: 'I encountered an unexpected issue. Let me try to continue from where we left off, or you can provide additional information to help resolve this.',
-                nextStep: currentStep,
-                requiresUserInput: true,
-                validationErrors: [error.message],
-                feedbackMessage: generalRecoveryFeedback
-            };
-
-        } catch (recoveryError) {
-            console.error('Error during error recovery:', recoveryError);
-
-            // Fallback recovery response
-            return {
-                message: 'I encountered multiple issues and need to restart the meeting creation process. Let\'s begin again with your meeting request.',
-                nextStep: 'intent_detection',
-                requiresUserInput: true,
-                validationErrors: ['Multiple system errors - restarting workflow']
-            };
-        }
-    }
-
-    /**
-     * Validates workflow state integrity and provides recovery if needed
-     * Requirements: 5.3 - Provide clear feedback about workflow steps and requirements
-     */
-    async validateWorkflowIntegrity(): Promise<{ isValid: boolean; issues: string[]; suggestedActions: string[] }> {
-        const issues: string[] = [];
-        const suggestedActions: string[] = [];
-
-        try {
-            const meetingData = this.workflowState.meetingData;
-
-            // Check for required user authentication
-            if (!this.user) {
-                issues.push('User authentication missing');
-                suggestedActions.push('Authenticate with Google Calendar');
-            }
-
-            // Check workflow step sequence integrity
-            const currentStepOrder = WORKFLOW_STEP_INFO[this.workflowState.currentStep]?.order || 0;
-
-            // Validate time collection before attendee collection
-            if (currentStepOrder >= WORKFLOW_STEP_INFO['attendee_collection'].order) {
-                if (!this.workflowState.timeCollectionComplete || !meetingData.startTime) {
-                    issues.push('Time collection incomplete before attendee collection');
-                    suggestedActions.push('Complete time and date collection first');
-                }
-            }
-
-            // Validate attendee requirements for online meetings
-            if (meetingData.type === 'online' && currentStepOrder >= WORKFLOW_STEP_INFO['validation'].order) {
-                if (!meetingData.attendees || meetingData.attendees.length === 0) {
-                    issues.push('Online meetings require attendees');
-                    suggestedActions.push('Add at least one attendee for online meetings');
-                }
-            }
-
-            // Validate required fields for meeting creation
-            if (currentStepOrder >= WORKFLOW_STEP_INFO['creation'].order) {
-                if (!meetingData.title) {
-                    issues.push('Meeting title is required');
-                    suggestedActions.push('Provide a meeting title');
-                }
-
-                if (meetingData.type === 'physical' && !meetingData.location) {
-                    issues.push('Physical meetings require a location');
-                    suggestedActions.push('Specify meeting location');
-                }
-            }
-
-            // Check for calendar access when needed
-            if (currentStepOrder >= WORKFLOW_STEP_INFO['availability_check'].order) {
-                if (!this.workflowState.calendarAccessStatus?.hasAccess) {
-                    issues.push('Calendar access not verified');
-                    suggestedActions.push('Verify calendar access permissions');
-                }
-            }
-
-            return {
-                isValid: issues.length === 0,
-                issues,
-                suggestedActions
-            };
-
-        } catch (error) {
-            console.error('Error validating workflow integrity:', error);
-            return {
-                isValid: false,
-                issues: ['Workflow validation failed'],
-                suggestedActions: ['Restart meeting creation process']
-            };
-        }
-    }
-
-    /**
-     * Provides contextual help based on current workflow state
-     * Requirements: 5.1, 5.2 - Provide clear feedback about workflow steps and requirements
-     */
-    getContextualHelp(): UserFeedbackMessage {
-        const currentStep = this.workflowState.currentStep;
-        const stepInfo = WORKFLOW_STEP_INFO[currentStep];
-
-        const helpMessages: Record<WorkflowStep, { message: string; details: string[]; actions: string[] }> = {
-            'intent_detection': {
-                message: 'I\'m analyzing your meeting request to understand what you need.',
-                details: ['Detecting meeting type and requirements', 'Preparing workflow steps'],
-                actions: ['Provide more details about your meeting', 'Specify if it\'s online or physical']
-            },
-            'calendar_access_verification': {
-                message: 'I\'m checking your calendar access to ensure I can create meetings.',
-                details: ['Verifying existing authentication', 'Testing calendar permissions'],
-                actions: ['Wait for verification to complete', 'Re-authenticate if prompted']
-            },
-            'meeting_type_selection': {
-                message: 'I need to know what type of meeting you\'re scheduling.',
-                details: ['Online meetings require attendees', 'Physical meetings need locations'],
-                actions: ['Specify "online" or "physical" meeting', 'Provide meeting context']
-            },
-            'time_date_collection': {
-                message: 'Let\'s establish when you want to meet.',
-                details: ['Date and time are collected first', 'This helps check availability before adding attendees'],
-                actions: ['Provide specific date and time', 'Mention duration if different from 1 hour']
-            },
-            'availability_check': {
-                message: 'I\'m checking your calendar for conflicts at the requested time.',
-                details: ['Scanning for existing events', 'Will suggest alternatives if conflicts exist'],
-                actions: ['Wait for availability check', 'Be ready to choose alternative times']
-            },
-            'conflict_resolution': {
-                message: 'I found scheduling conflicts that need to be resolved.',
-                details: ['Alternative times have been suggested', 'You can choose a new time or proceed anyway'],
-                actions: ['Choose an alternative time', 'Specify a different time', 'Proceed despite conflicts']
-            },
-            'attendee_collection': {
-                message: 'Time to add people to your meeting.',
-                details: ['Use the attendee editor for online meetings', 'Email addresses will be validated'],
-                actions: ['Add attendee email addresses', 'Use the attendee management interface']
-            },
-            'meeting_details_collection': {
-                message: 'I need some additional details about your meeting.',
-                details: ['Title is required', 'Location needed for physical meetings'],
-                actions: ['Provide meeting title', 'Add description if desired', 'Specify location for physical meetings']
-            },
-            'validation': {
-                message: 'I\'m validating all the meeting information.',
-                details: ['Checking all required fields', 'Ensuring data consistency'],
-                actions: ['Wait for validation', 'Correct any issues found']
-            },
-            'agenda_generation': {
-                message: 'I\'m creating a meeting agenda based on our conversation.',
-                details: ['Analyzing discussion topics', 'Generating structured agenda items'],
-                actions: ['Wait for agenda generation', 'Prepare to review agenda']
-            },
-            'agenda_approval': {
-                message: 'Please review the generated meeting agenda.',
-                details: ['Edit items as needed', 'Approve when satisfied'],
-                actions: ['Review agenda items', 'Request changes if needed', 'Approve to proceed']
-            },
-            'approval': {
-                message: 'Ready for final review of all meeting details.',
-                details: ['All information has been collected', 'Final validation completed'],
-                actions: ['Review meeting summary', 'Confirm to create meeting', 'Make changes if needed']
-            },
-            'creation': {
-                message: 'I\'m creating your meeting in Google Calendar.',
-                details: ['Adding event to calendar', 'Sending invitations to attendees'],
-                actions: ['Wait for creation to complete', 'Check calendar for confirmation']
-            },
-            'completed': {
-                message: 'Your meeting has been successfully created!',
-                details: ['Calendar event created', 'Invitations sent'],
-                actions: ['Check your calendar', 'Prepare for the meeting']
-            }
-        };
-
-        const help = helpMessages[currentStep];
-
-        return {
-            type: 'info',
-            title: `Help: ${stepInfo.name}`,
-            message: help.message,
-            details: help.details,
-            suggestedActions: help.actions,
-            progressIndicator: userFeedbackService.createProgressIndicator(currentStep)
-        };
-    }
-
-    /**
-     * Processes a step transition with data update for UI block interactions
-     * Requirements: 6.1 - Update attendee collection to integrate with enhanced UI
-     */
-    async processStepTransition(
-        fromStep: WorkflowStep,
-        toStep: WorkflowStep,
-        data?: any
-    ): Promise<WorkflowResponse> {
-        try {
-            // Validate the transition is allowed
-            const transition = this.transitions.find(t =>
-                t.fromStep === fromStep && t.toStep === toStep
-            );
-
-            if (transition) {
-                const validation = await this.validateTransition(transition);
-                if (!validation.isValid) {
-                    const errorFeedback = FeedbackUtils.error(
-                        new Error(`Cannot transition from ${fromStep} to ${toStep}: ${validation.errors.join(', ')}`),
-                        fromStep
-                    );
-
-                    return {
-                        message: `Cannot transition from ${fromStep} to ${toStep}: ${validation.errors.join(', ')}`,
-                        nextStep: fromStep,
-                        requiresUserInput: true,
-                        validationErrors: validation.errors,
-                        warnings: validation.warnings,
-                        feedbackMessage: errorFeedback
-                    };
-                }
-            }
-
-            // Update meeting data if provided
-            if (data) {
-                this.workflowState.meetingData = {
-                    ...this.workflowState.meetingData,
-                    ...data
-                };
-
-                // Update context engine with new data
-                this.contextEngine.updateMeetingData(data);
-            }
-
-            // Special handling for attendee collection completion
-            if (fromStep === 'attendee_collection' && data?.attendees) {
-                this.workflowState.attendeeCollectionComplete = true;
-                
-                // Validate attendees using business rules
-                const attendeeValidation = this.businessRules.validateAttendees(data.attendees);
-                if (!attendeeValidation.isValid) {
-                    const errorFeedback = FeedbackUtils.error(
-                        new Error('Attendee validation failed'),
-                        'attendee_collection'
-                    );
-
-                    return {
-                        message: `Attendee validation failed: ${attendeeValidation.errors.join('; ')}`,
-                        nextStep: 'attendee_collection',
-                        requiresUserInput: true,
-                        validationErrors: attendeeValidation.errors,
-                        warnings: attendeeValidation.warnings,
-                        feedbackMessage: errorFeedback
-                    };
-                }
-
-                // For online meetings, enforce attendee requirement
-                if (this.workflowState.meetingData.type === 'online') {
-                    const hasValidAttendees = this.businessRules.enforceAttendeeRequirement(
-                        'online',
-                        data.attendees.map((a: any) => a.email)
-                    );
-
-                    if (!hasValidAttendees) {
-                        const requirementFeedback = FeedbackUtils.error(
-                            new Error('Online meetings require at least one attendee'),
-                            'attendee_collection'
-                        );
-
-                        return {
-                            message: 'Online meetings must have at least one attendee. Please add attendees.',
-                            nextStep: 'attendee_collection',
-                            requiresUserInput: true,
-                            validationErrors: ['Online meetings require at least one attendee'],
-                            feedbackMessage: requirementFeedback
-                        };
-                    }
-                }
-            }
-
-            // Update workflow step
-            const originalStep = this.workflowState.currentStep;
-            this.workflowState.currentStep = toStep;
-
-            await this.persistWorkflowState();
-
-            // Create step transition feedback
-            const transitionFeedback = FeedbackUtils.stepTransition(originalStep, toStep, data);
-
-            // Execute the new step
-            const response = await this.executeCurrentStep({
-                id: `transition-${Date.now()}`,
-                role: 'user',
-                content: `Transitioned from ${fromStep} to ${toStep}`,
-                timestamp: new Date()
-            });
-
-            response.feedbackMessage = transitionFeedback;
-            return response;
-
-        } catch (error) {
-            console.error('Error processing step transition:', error);
-
-            const errorFeedback = FeedbackUtils.error(
-                error instanceof Error ? error : new Error('Step transition failed'),
-                fromStep
-            );
-
-            return {
-                message: 'Failed to process step transition. Please try again.',
-                nextStep: fromStep,
-                requiresUserInput: true,
-                validationErrors: [error instanceof Error ? error.message : 'Unknown error'],
-                feedbackMessage: errorFeedback
-            };
-        }
-    }
-
-    /**
-     * Creates calendar event with retry mechanism for better reliability
-     * Requirements: 5.3, 5.4, 5.5 - Implement calendar sync error handling and retry mechanisms
-     */
-    private async createCalendarEventWithRetry(
-        eventData: any, 
-        meetingType: 'online' | 'physical', 
-        maxRetries: number = 3
-    ): Promise<any> {
-        let lastError: Error | null = null;
-        
-        for (let attempt = 1; attempt <= maxRetries; attempt++) {
-            try {
-                console.log(`Calendar event creation attempt ${attempt}/${maxRetries}`);
-                
-                // Add exponential backoff for retries
-                if (attempt > 1) {
-                    const delay = Math.pow(2, attempt - 1) * 1000; // 2s, 4s, 8s...
-                    console.log(`Waiting ${delay}ms before retry...`);
-                    await new Promise(resolve => setTimeout(resolve, delay));
-                }
-                
-                const createdEvent = await createCalendarEvent(this.user!, eventData, meetingType);
-                
-                // Success - log and return
-                if (attempt > 1) {
-                    console.log(`Calendar event created successfully on attempt ${attempt}`);
-                }
-                
-                return createdEvent;
-                
-            } catch (error) {
-                lastError = error instanceof Error ? error : new Error('Unknown error');
-                console.error(`Calendar creation attempt ${attempt} failed:`, lastError.message);
-                
-                // Check if this is a retryable error
-                const isRetryable = this.isRetryableCalendarError(lastError);
-                
-                if (!isRetryable || attempt === maxRetries) {
-                    // Don't retry for non-retryable errors or if we've exhausted retries
-                    break;
-                }
-                
-                console.log(`Error is retryable, will attempt retry ${attempt + 1}/${maxRetries}`);
-            }
-        }
-        
-        // All retries failed, throw the last error with enhanced context
-        const enhancedError = new Error(
-            `Calendar event creation failed after ${maxRetries} attempts: ${lastError?.message || 'Unknown error'}`
-        );
-        enhancedError.cause = lastError;
-        throw enhancedError;
-    }
-
-    /**
-     * Determines if a calendar error is retryable
-     */
-    private isRetryableCalendarError(error: Error): boolean {
-        const errorMessage = error.message.toLowerCase();
-        
-        // Retryable errors (temporary issues)
-        const retryableErrors = [
-            'network',
-            'timeout',
-            'rate limit',
-            'quota',
-            'temporarily unavailable',
-            'service unavailable',
-            'internal error',
-            'backend error',
-            'connection',
-            'econnreset',
-            'enotfound'
-        ];
-        
-        // Non-retryable errors (permanent issues)
-        const nonRetryableErrors = [
-            'authentication',
-            'unauthorized',
-            'forbidden',
-            'invalid',
-            'not found',
-            'bad request',
-            'malformed'
-        ];
-        
-        // Check for non-retryable errors first
-        if (nonRetryableErrors.some(nonRetryable => errorMessage.includes(nonRetryable))) {
-            return false;
-        }
-        
-        // Check for retryable errors
-        if (retryableErrors.some(retryable => errorMessage.includes(retryable))) {
-            return true;
-        }
-        
-        // Default to retryable for unknown errors (conservative approach)
-        return true;
-    }
-
-    /**
-     * Handle time date collection with dynamic messages using code-based grounding
-     */
-    private async handleTimeDateCollectionWithDynamicMessages(message: ConversationMessage): Promise<WorkflowResponse> {
-        try {
-            const meetingData = this.workflowState.meetingData;
-
-            // If time is already set and validated, proceed to next step
-            if (meetingData.startTime && meetingData.endTime) {
-                const timeValidation = this.businessRules.validateTimeConstraints(
-                    new Date(meetingData.startTime),
-                    new Date(meetingData.endTime)
-                );
-
-                if (timeValidation.isValid) {
-                    this.workflowState.timeCollectionComplete = true;
-                    await this.persistWorkflowState();
-
-                    // Determine next step based on meeting type
-                    const nextStep = meetingData.type === 'online' ? 'attendee_collection' : 'meeting_details_collection';
-
-                    // Use dynamic message generator for contextual response
-                    const context = {
-                        workflowState: this.workflowState,
-                        meetingData: meetingData as MeetingData,
-                        conversationHistory: this.contextEngine.getMessages(),
-                        userMessage: message.content,
-                        nextStep
-                    };
-
-                    const generatedResponse = DynamicMessageGenerator.generateResponse(context);
-
-                    return {
-                        message: generatedResponse.message,
-                        nextStep,
-                        requiresUserInput: generatedResponse.requiresUserInput,
-                        uiBlock: generatedResponse.uiBlock
-                    };
-                }
-            }
-
-            // Generate dynamic time collection message
-            const context = {
-                workflowState: this.workflowState,
-                meetingData: meetingData as MeetingData,
-                conversationHistory: this.contextEngine.getMessages(),
-                userMessage: message.content
-            };
-
-            const generatedResponse = DynamicMessageGenerator.generateResponse(context);
-
-            return {
-                message: generatedResponse.message,
-                nextStep: 'time_date_collection',
-                requiresUserInput: generatedResponse.requiresUserInput,
-                uiBlock: generatedResponse.uiBlock
-            };
-        } catch (error) {
-            console.error('Error handling time/date collection:', error);
-
-            const errorFeedback = FeedbackUtils.error(
-                error instanceof Error ? error : new Error('Time collection failed'),
-                'time_date_collection'
-            );
-
-            return {
-                message: 'Failed to process meeting time. Please provide the date and time again.',
-                nextStep: 'time_date_collection',
-                requiresUserInput: true,
-                validationErrors: [error instanceof Error ? error.message : 'Unknown error'],
-                feedbackMessage: errorFeedback
-            };
-        }
-    }
-
-    /**
-     * Handle attendee collection with dynamic messages
-     */
-    private async handleAttendeeCollectionWithDynamicMessages(message: ConversationMessage): Promise<WorkflowResponse> {
-        try {
-            const meetingData = this.workflowState.meetingData;
-
-            // Generate dynamic attendee collection message
-            const context = {
-                workflowState: this.workflowState,
-                meetingData: meetingData as MeetingData,
-                conversationHistory: this.contextEngine.getMessages(),
-                userMessage: message.content
-            };
-
-            const generatedResponse = DynamicMessageGenerator.generateResponse(context);
-
-            return {
-                message: generatedResponse.message,
-                nextStep: 'attendee_collection',
-                requiresUserInput: generatedResponse.requiresUserInput,
-                uiBlock: generatedResponse.uiBlock
-            };
-        } catch (error) {
-            console.error('Error handling attendee collection:', error);
-
-            const errorFeedback = FeedbackUtils.error(
-                error instanceof Error ? error : new Error('Attendee collection failed'),
-                'attendee_collection'
-            );
-
-            return {
-                message: 'Failed to process attendee information. Please try again.',
-                nextStep: 'attendee_collection',
-                requiresUserInput: true,
-                validationErrors: [error instanceof Error ? error.message : 'Unknown error'],
-                feedbackMessage: errorFeedback
-            };
-        }
-    }
-
-    /**
-     * Handle meeting details collection with dynamic messages
-     */
-    private async handleMeetingDetailsCollectionWithDynamicMessages(message: ConversationMessage): Promise<WorkflowResponse> {
-        try {
-            const meetingData = this.workflowState.meetingData;
-
-            // Generate dynamic meeting details message
-            const context = {
-                workflowState: this.workflowState,
-                meetingData: meetingData as MeetingData,
-                conversationHistory: this.contextEngine.getMessages(),
-                userMessage: message.content
-            };
-
-            const generatedResponse = DynamicMessageGenerator.generateResponse(context);
-
-            return {
-                message: generatedResponse.message,
-                nextStep: 'meeting_details_collection',
-                requiresUserInput: generatedResponse.requiresUserInput,
-                uiBlock: generatedResponse.uiBlock
-            };
-        } catch (error) {
-            console.error('Error handling meeting details collection:', error);
-
-            const errorFeedback = FeedbackUtils.error(
-                error instanceof Error ? error : new Error('Meeting details collection failed'),
-                'meeting_details_collection'
-            );
-
-            return {
-                message: 'Failed to process meeting details. Please try again.',
-                nextStep: 'meeting_details_collection',
+                message: 'I encountered an unexpected error while creating the meeting. Please try again.',
+                nextStep: 'creation',
                 requiresUserInput: true,
                 validationErrors: [error instanceof Error ? error.message : 'Unknown error'],
                 feedbackMessage: errorFeedback

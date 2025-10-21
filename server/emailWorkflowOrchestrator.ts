@@ -254,7 +254,10 @@ export class EmailWorkflowOrchestrator {
         const result = await gmailService.sendBatchAgendaEmails(
           user,
           job.attendees,
-          job.meetingData,
+          {
+            ...job.meetingData,
+            description: job.agendaContent.enhancedPurpose || job.meetingData.description || ''
+          },
           job.agendaContent
         );
 

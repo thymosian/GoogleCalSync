@@ -6,6 +6,7 @@ import { TooltipProvider } from "@/components/ui/tooltip";
 import { ThemeProvider } from "@/components/ThemeProvider";
 import { GoogleAuthButton } from "@/components/GoogleAuthButton";
 import Dashboard from "@/pages/Dashboard";
+import TaskAccess from "@/pages/TaskAccess";
 import NotFound from "@/pages/not-found";
 import { useAuth } from "@/hooks/useAuth";
 import { useSessionExtension } from "@/hooks/useSessionExtension";
@@ -66,6 +67,7 @@ function Router() {
   return (
     <Switch>
       <Route path="/" component={Dashboard} />
+      <Route path="/tasks/:meetingId" component={TaskAccess} />
       <Route component={NotFound} />
     </Switch>
   );

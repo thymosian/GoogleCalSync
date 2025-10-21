@@ -260,11 +260,25 @@ export class BusinessRulesEngine {
 
     // Validate time constraints
     if (meetingData.startTime && meetingData.endTime) {
-      const timeValidation = this.validateTimeConstraints(meetingData.startTime, meetingData.endTime);
-      result.errors.push(...timeValidation.errors);
-      result.warnings.push(...timeValidation.warnings);
-      if (!timeValidation.isValid) {
+      // Convert to Date objects if they're strings
+      const startDate = meetingData.startTime instanceof Date 
+        ? meetingData.startTime 
+        : new Date(meetingData.startTime);
+      const endDate = meetingData.endTime instanceof Date 
+        ? meetingData.endTime 
+        : new Date(meetingData.endTime);
+      
+      // Skip validation if dates are invalid
+      if (isNaN(startDate.getTime()) || isNaN(endDate.getTime())) {
         result.isValid = false;
+        result.errors.push('Invalid date format for meeting times');
+      } else {
+        const timeValidation = this.validateTimeConstraints(startDate, endDate);
+        result.errors.push(...timeValidation.errors);
+        result.warnings.push(...timeValidation.warnings);
+        if (!timeValidation.isValid) {
+          result.isValid = false;
+        }
       }
     }
 

@@ -7,23 +7,40 @@ import type { User } from "../shared/schema";
 passport.use(new GoogleStrategy({
   clientID: process.env.GOOGLE_CLIENT_ID!,
   clientSecret: process.env.GOOGLE_CLIENT_SECRET!,
-  callbackURL: "/api/auth/google/callback"
-}, async (accessToken, refreshToken, profile, done) => {
+  callbackURL: "/api/auth/google/callback",
+  passReqToCallback: true
+}, async (req, accessToken, refreshToken, profile, done) => {
   try {
-    console.log('Google OAuth callback triggered for user:', profile.displayName);
+    const timestamp = new Date().toISOString();
+    const sessionId = req.sessionID || 'unknown';
+
+    console.log(`[${timestamp}] Google OAuth callback triggered for user: ${profile.displayName} (Session: ${sessionId})`);
+
+    // Check if this is a duplicate callback (Google sometimes sends multiple requests)
+    const lastCallbackTime = req.session.lastCallbackTime;
+    const now = Date.now();
+
+    if (lastCallbackTime && (now - lastCallbackTime) < 5000) { // Within 5 seconds
+      console.log(`[${timestamp}] Duplicate OAuth callback detected, skipping (Session: ${sessionId})`);
+      return done(null, req.user); // Return existing user if available
+    }
+
+    // Update last callback time
+    req.session.lastCallbackTime = now;
+
     const googleId = profile.id;
     let user = await storage.getUserByGoogleId(googleId);
-    
+
     if (user) {
       // Update tokens for existing user
-      console.log('Updating existing user tokens');
+      console.log(`[${timestamp}] Updating existing user tokens for: ${profile.displayName} (Session: ${sessionId})`);
       await storage.updateUserTokens(googleId, accessToken, refreshToken);
       user.accessToken = accessToken;
       user.refreshToken = refreshToken;
       return done(null, user);
     } else {
       // Create new user
-      console.log('Creating new user');
+      console.log(`[${timestamp}] Creating new user: ${profile.displayName} (Session: ${sessionId})`);
       const newUser = await storage.createUser({
         googleId,
         email: profile.emails?.[0]?.value || '',
@@ -32,11 +49,12 @@ passport.use(new GoogleStrategy({
         accessToken,
         refreshToken
       });
-      console.log('New user created:', newUser.id);
+      console.log(`[${timestamp}] New user created: ${newUser.id} (Session: ${sessionId})`);
       return done(null, newUser);
     }
   } catch (error) {
-    console.error('OAuth callback error:', error);
+    const timestamp = new Date().toISOString();
+    console.error(`[${timestamp}] OAuth callback error:`, error);
     return done(error, undefined);
   }
 }));

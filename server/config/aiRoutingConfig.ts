@@ -54,6 +54,12 @@ export const DEFAULT_ROUTING_CONFIG: AIRoutingConfiguration = {
             enableFallback: true,
             timeout: 30000
         },
+        enhancePurposeWording: {
+            primaryModel: 'gemini',
+            fallbackModel: 'mistral',
+            enableFallback: true,
+            timeout: 25000
+        },
         // Simple tasks -> Mistral primary, Gemini fallback
         getGeminiResponse: {
             primaryModel: 'mistral',

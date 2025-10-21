@@ -1,4 +1,6 @@
 import { EmailSendingStatus } from './emailWorkflowOrchestrator.js';
+import { emailTemplateService } from './emailTemplateService.js';
+import { MeetingData } from '../shared/schema.js';
 
 /**
  * Interface for email notification
@@ -255,6 +257,41 @@ export class EmailNotificationService {
         this.notifications.set(userId, filteredNotifications);
       }
     });
+  }
+
+  /**
+   * Generate HTML email template for agenda
+   */
+  generateAgendaEmailHtml(
+    agenda: string,
+    meetingData: Partial<MeetingData>,
+    recipientEmail?: string
+  ): string {
+    return emailTemplateService.generateAgendaEmailTemplate(agenda, meetingData, recipientEmail);
+  }
+
+  /**
+   * Generate plain text version of agenda email
+   */
+  generateAgendaEmailPlainText(
+    agenda: string,
+    meetingData: Partial<MeetingData>
+  ): string {
+    return emailTemplateService.generateAgendaEmailPlainText(agenda, meetingData);
+  }
+
+  /**
+   * Create email content for agenda distribution
+   */
+  createAgendaEmailContent(
+    agenda: string,
+    meetingData: Partial<MeetingData>,
+    recipientEmail?: string
+  ): { html: string; plainText: string } {
+    return {
+      html: this.generateAgendaEmailHtml(agenda, meetingData, recipientEmail),
+      plainText: this.generateAgendaEmailPlainText(agenda, meetingData)
+    };
   }
 }
 

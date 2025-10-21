@@ -2,7 +2,7 @@
  * AI-powered time extraction utility using Mistral for natural language processing
  */
 
-import { extractTimeFromNaturalLanguage } from './mistralTimeExtractor.js';
+import { aiRouter } from './aiRouterService.js';
 
 export interface ExtractedTime {
     startTime: Date;
@@ -35,15 +35,23 @@ export async function extractTimeFromMessage(
             ...context
         };
 
-        // Use Mistral for intelligent time parsing
-        const mistralResult = await extractTimeFromNaturalLanguage(message, timeContext);
+        // Use AI router to call the appropriate AI service
+        const result = await aiRouter.routeRequest(
+            'extractTimeFromNaturalLanguage',
+            [message, timeContext]
+        ) as {
+            startTime: string;
+            endTime?: string;
+            confidence: number;
+            reasoning: string;
+        } | null;
 
-        if (mistralResult) {
+        if (result) {
             return {
-                startTime: new Date(mistralResult.startTime),
-                endTime: mistralResult.endTime ? new Date(mistralResult.endTime) : undefined,
-                confidence: mistralResult.confidence,
-                reasoning: mistralResult.reasoning
+                startTime: new Date(result.startTime),
+                endTime: result.endTime ? new Date(result.endTime) : undefined,
+                confidence: result.confidence,
+                reasoning: result.reasoning
             };
         }
 

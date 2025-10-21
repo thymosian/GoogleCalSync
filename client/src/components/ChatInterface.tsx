@@ -21,6 +21,7 @@ interface MeetingData {
   attendees: Attendee[];
   includeMeetLink: boolean;
   purpose?: string;
+  enhancedPurpose?: string;
   aiSuggestions?: string[];
 }
 
@@ -81,6 +82,15 @@ export function ChatInterface({
   const scrollAreaRef = useRef<HTMLDivElement>(null);
   const [meetingData, setMeetingData] = useState<Record<string, MeetingData>>({});
   const [processingMeeting, setProcessingMeeting] = useState(false);
+  const [completedBlocks, setCompletedBlocks] = useState<Set<string>>(new Set());
+
+  // Mark a UI block as completed (read-only, faded)
+  const markBlockAsCompleted = (blockId: string) => {
+    setCompletedBlocks(prev => new Set([...prev, blockId]));
+  };
+
+  // Check if a block is completed
+  const isBlockCompleted = (blockId: string) => completedBlocks.has(blockId);
 
   useEffect(() => {
     if (scrollAreaRef.current) {
@@ -131,10 +141,14 @@ export function ChatInterface({
         );
 
         const extraction = await response.json();
+        console.log('Meeting intent extraction:', extraction);
 
         if (extraction.intent !== 'other' && extraction.confidence > 0.6) {
+          console.log('Meeting intent detected, starting workflow...');
           // Start the meeting creation flow
           await startMeetingCreationFlow(extraction, userMessage);
+        } else {
+          console.log('No meeting intent detected or confidence too low');
         }
       } catch (error) {
         console.error('Error extracting meeting intent:', error);
@@ -145,46 +159,89 @@ export function ChatInterface({
   };
 
   const startMeetingCreationFlow = async (extraction: MeetingExtraction, originalMessage: string) => {
-    const meetingId = `meeting-${Date.now()}`;
+    try {
+      // Generate or use existing conversation ID
+      const conversationId = `conv-${Date.now()}-${Math.random().toString(36).substr(2, 9)}`;
 
-    // Initialize meeting data
-    const newMeetingData: MeetingData = {
-      id: meetingId,
-      title: extraction.fields.suggestedTitle,
-      startTime: extraction.fields.startTime,
-      endTime: extraction.fields.endTime,
-      attendees: extraction.fields.participants.map(email => ({
-        email: email.toLowerCase(),
-        verified: email.toLowerCase().includes('@gmail.com') || email.toLowerCase().includes('@google.com')
-      })),
-      includeMeetLink: false,
-      purpose: extraction.fields.purpose
-    };
+      // Call the conversational workflow API instead of hardcoded flow
+      const response = await apiRequest('POST', '/api/chat/conversational', {
+        message: originalMessage,
+        conversationId: conversationId,
+        context: messages.slice(-3).map(m => ({ role: m.role, content: m.content }))
+      });
 
-    setMeetingData(prev => ({ ...prev, [meetingId]: newMeetingData }));
+      const workflowResponse = await response.json();
 
-    // Add AI response with meeting link choice - FIRST QUESTION
-    const assistantMessage: ChatMessage = {
-      id: `msg-${Date.now()}`,
-      role: 'assistant',
-      content: "I'd be happy to help create this meeting!\n\nWould you like to include a Google Meet link?",
-      timestamp: new Date(),
-      uiBlock: {
-        type: 'meeting_link_choice',
-        data: {
-          question: "Would you like to include a Google Meet link for this meeting?",
-          meetingId
+      if (workflowResponse && workflowResponse.message) {
+        const meetingId = `meeting-${Date.now()}`;
+        
+        // Create assistant message with the workflow response
+        const assistantMessage: ChatMessage = {
+          id: `msg-${Date.now()}`,
+          role: 'assistant',
+          content: workflowResponse.message,
+          timestamp: new Date(),
+          uiBlock: workflowResponse.uiBlock,
+          metadata: {
+            extraction,
+            meetingId
+          }
+        };
+
+        // Debug logging
+        console.log('Workflow response:', workflowResponse);
+        console.log('UI Block:', workflowResponse.uiBlock);
+        console.log('Workflow step:', workflowResponse.workflow?.currentStep);
+
+        // Store the meeting data from the workflow response
+        if (workflowResponse.workflow?.meetingData) {
+          setMeetingData(prev => ({
+            ...prev,
+            [meetingId]: {
+              id: meetingId,
+              attendees: [],
+              includeMeetLink: false,
+              ...workflowResponse.workflow.meetingData
+            }
+          }));
+          console.log('Stored meeting data from workflow:', workflowResponse.workflow.meetingData);
         }
-      },
-      metadata: {
-        extraction,
-        meetingId
-      }
-    };
 
-    // Add the assistant message with UI block to the message list
-    if (onAddAssistantMessage) {
-      onAddAssistantMessage(assistantMessage);
+        // Add the assistant message with UI block to the message list
+        if (onAddAssistantMessage) {
+          onAddAssistantMessage(assistantMessage);
+        }
+
+        // Store conversation ID for future interactions
+        if (workflowResponse.conversationId) {
+          localStorage.setItem('currentConversationId', workflowResponse.conversationId);
+          console.log('Stored conversation ID:', workflowResponse.conversationId);
+        }
+
+        // Debug workflow state
+        if (workflowResponse.workflow) {
+          console.log('Current workflow step:', workflowResponse.workflow.currentStep);
+          console.log('Workflow requires user input:', workflowResponse.workflow.requiresUserInput);
+          console.log('UI Block type:', workflowResponse.uiBlock?.type);
+        }
+      }
+    } catch (error) {
+      console.error('Error starting conversational workflow:', error);
+
+      // Fallback to simple message if conversational API fails
+      const fallbackMessage: ChatMessage = {
+        id: `msg-${Date.now()}`,
+        role: 'assistant',
+        content: "I understand you want to schedule a meeting. Let me help you set that up. First, what type of meeting would you like to schedule?",
+        timestamp: new Date(),
+        metadata: {
+          extraction
+        }
+      };
+
+      if (onAddAssistantMessage) {
+        onAddAssistantMessage(fallbackMessage);
+      }
     }
   };
 
@@ -259,15 +316,21 @@ export function ChatInterface({
   };
 
   const handleAttendeesUpdate = async (attendees: Attendee[], meetingId: string) => {
-    setMeetingData(prev => ({
-      ...prev,
-      [meetingId]: { ...prev[meetingId], attendees }
-    }));
+    console.log('=== handleAttendeesUpdate called for meetingId:', meetingId, 'attendees count:', attendees.length);
+    
+    // Update attendees in state
+    const updatedMeetingData = { ...meetingData };
+    const currentMeeting = { ...meetingData[meetingId], attendees };
+    updatedMeetingData[meetingId] = currentMeeting;
+    
+    setMeetingData(updatedMeetingData);
+    console.log('Updated meeting data with attendees, current state:', currentMeeting);
 
     // Generate AI title suggestions if we have enough context
-    const currentMeeting = meetingData[meetingId];
+    // Use the updated currentMeeting object directly instead of stale state
     if (currentMeeting?.purpose && attendees.length > 0) {
       try {
+        console.log('Calling /api/ai/generate-titles with purpose:', currentMeeting.purpose.substring(0, 100) + '...');
         const response = await apiRequest(
           'POST',
           '/api/ai/generate-titles',
@@ -279,6 +342,23 @@ export function ChatInterface({
         );
 
         const titleSuggestion = await response.json();
+        console.log('Received titleSuggestion response:', titleSuggestion);
+        console.log('titleSuggestion properties:', Object.keys(titleSuggestion));
+
+        // Store the enhanced purpose in meeting data
+        if (titleSuggestion.enhancedPurpose) {
+          console.log('✓ Storing enhanced purpose:', titleSuggestion.enhancedPurpose.substring(0, 100) + '...');
+          setMeetingData(prev => {
+            const updated = {
+              ...prev,
+              [meetingId]: { ...prev[meetingId], enhancedPurpose: titleSuggestion.enhancedPurpose }
+            };
+            console.log('State updated with enhancedPurpose:', updated[meetingId]);
+            return updated;
+          });
+        } else {
+          console.warn('✗ No enhancedPurpose in response. Response keys:', Object.keys(titleSuggestion));
+        }
 
         const message: ChatMessage = {
           id: `msg-${Date.now()}`,
@@ -288,7 +368,7 @@ export function ChatInterface({
           uiBlock: {
             type: 'title_suggestions',
             data: {
-              suggestions: titleSuggestion.suggestions,
+              suggestions: titleSuggestion.titleSuggestions || titleSuggestion.suggestions || [titleSuggestion.title],
               currentTitle: currentMeeting.title,
               meetingId
             }
@@ -300,6 +380,9 @@ export function ChatInterface({
         }
       } catch (error) {
         console.error('Error generating titles:', error);
+        // If title generation failed, also try to store any fallback enhanced purpose
+        console.log('Title generation failed, attempting to use original purpose');
+        
         // Fallback to a simple message if title generation fails
         const message: ChatMessage = {
           id: `msg-${Date.now()}`,
@@ -386,23 +469,50 @@ export function ChatInterface({
 
   const handleCreateEvent = async (meetingId: string) => {
     const currentMeeting = meetingData[meetingId];
-    if (!currentMeeting) return;
+    if (!currentMeeting) {
+      console.error('Meeting not found for meetingId:', meetingId);
+      return;
+    }
 
     try {
+      // Use enhanced purpose if available, otherwise use original purpose, with fallback to generic description
+      const description = currentMeeting.enhancedPurpose && currentMeeting.enhancedPurpose.trim() !== ''
+        ? currentMeeting.enhancedPurpose
+        : currentMeeting.purpose || 'Meeting created via AI Calendar Assistant';
+
+      console.log('=== Creating calendar event for meetingId:', meetingId);
+      console.log('Full meeting data keys:', Object.keys(currentMeeting));
+      console.log('Meeting data:', {
+        title: currentMeeting.title,
+        purpose: currentMeeting.purpose,
+        enhancedPurpose: currentMeeting.enhancedPurpose,
+        hasEnhancedPurpose: !!currentMeeting.enhancedPurpose,
+        enhancedPurposeLength: currentMeeting.enhancedPurpose?.length || 0,
+        selectedDescription: description,
+        descriptionLength: description.length,
+        isUsingEnhanced: currentMeeting.enhancedPurpose && currentMeeting.enhancedPurpose.trim() !== ''
+      });
+      console.log('Sending description to API:', description.substring(0, 100) + '...');
+
+      const requestPayload = {
+        title: currentMeeting.title,
+        startTime: currentMeeting.startTime,
+        endTime: currentMeeting.endTime,
+        attendees: currentMeeting.attendees,
+        createMeetLink: currentMeeting.includeMeetLink,
+        description: description
+      };
+      
+      console.log('Request payload description:', requestPayload.description.substring(0, 100) + '...');
+      
       const response = await apiRequest(
         'POST',
         '/api/calendar/events',
-        {
-          title: currentMeeting.title,
-          startTime: currentMeeting.startTime,
-          endTime: currentMeeting.endTime,
-          attendees: currentMeeting.attendees,
-          createMeetLink: currentMeeting.includeMeetLink,
-          description: `Meeting created via AI Calendar Assistant`
-        }
+        requestPayload
       );
 
       const responseData = await response.json();
+      console.log('Calendar event creation response:', responseData);
 
       if (responseData.success) {
         const successMessage: ChatMessage = {
@@ -528,12 +638,21 @@ export function ChatInterface({
 
                   {/* Render interactive UI blocks for meeting creation */}
                   {message.uiBlock && (
-                    <div className="mt-3">
+                    <div
+                      className={`mt-3 transition-opacity duration-300 ${
+                        isBlockCompleted(message.id) ? 'opacity-50 pointer-events-none' : ''
+                      }`}
+                    >
                       {/* Check if it's a conversational UI block */}
                       {(['meeting_type_selection', 'attendee_management', 'meeting_approval', 'agenda_editor'].includes(message.uiBlock.type)) ? (
                         <ConversationalMeetingUIBlock
                           uiBlock={message.uiBlock as ConversationalUIBlock}
-                          onTypeSelect={onTypeSelect}
+                          onTypeSelect={(type, meetingId, location) => {
+                            console.log('Meeting type selected:', type, meetingId, location);
+                            if (onTypeSelect) {
+                              onTypeSelect(type, meetingId, location);
+                            }
+                          }}
                           onAttendeesUpdate={onAttendeesUpdate}
                           onContinue={onContinue}
                           onApprove={onApprove}
@@ -541,6 +660,8 @@ export function ChatInterface({
                           onAgendaUpdate={onAgendaUpdate}
                           onAgendaApprove={onAgendaApprove}
                           onAgendaRegenerate={onAgendaRegenerate}
+                          isCompleted={isBlockCompleted(message.id)}
+                          onMarkCompleted={() => markBlockAsCompleted(message.id)}
                         />
                       ) : (
                         <MeetingUIBlock

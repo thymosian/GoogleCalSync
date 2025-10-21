@@ -563,6 +563,8 @@ interface ConversationalMeetingUIBlockProps {
   onAgendaUpdate?: (agenda: string, meetingId: string) => void;
   onAgendaApprove?: (agenda: string, meetingId: string) => void;
   onAgendaRegenerate?: (meetingId: string) => void;
+  isCompleted?: boolean;
+  onMarkCompleted?: () => void;
 }
 
 export function ConversationalMeetingUIBlock({
@@ -575,41 +577,53 @@ export function ConversationalMeetingUIBlock({
   onAgendaUpdate,
   onAgendaApprove,
   onAgendaRegenerate,
+  isCompleted = false,
+  onMarkCompleted,
 }: ConversationalMeetingUIBlockProps) {
-  switch (uiBlock.type) {
-    case 'meeting_type_selection':
-      return (
-        <MeetingTypeSelection
-          data={uiBlock.data}
-          onTypeSelect={onTypeSelect || (() => {})}
-        />
-      );
-    case 'attendee_management':
-      return (
-        <AttendeeManagement
-          data={uiBlock.data}
-          onAttendeesUpdate={onAttendeesUpdate || (() => {})}
-          onContinue={onContinue || (() => {})}
-        />
-      );
-    case 'meeting_approval':
-      return (
-        <MeetingApproval
-          data={uiBlock.data}
-          onApprove={onApprove || (() => {})}
-          onEdit={onEdit || (() => {})}
-        />
-      );
-    case 'agenda_editor':
-      return (
-        <AgendaEditorBlock
-          data={uiBlock.data}
-          onAgendaUpdate={onAgendaUpdate || (() => {})}
-          onAgendaApprove={onAgendaApprove || (() => {})}
-          onAgendaRegenerate={onAgendaRegenerate || (() => {})}
-        />
-      );
-    default:
-      return null;
-  }
+  const containerClass = `transition-opacity duration-300 ${
+    isCompleted ? 'opacity-50 pointer-events-none' : ''
+  }`;
+
+  return (
+    <div className={containerClass}>
+      {(() => {
+        switch (uiBlock.type) {
+          case 'meeting_type_selection':
+            return (
+              <MeetingTypeSelection
+                data={uiBlock.data}
+                onTypeSelect={onTypeSelect || (() => {})}
+              />
+            );
+          case 'attendee_management':
+            return (
+              <AttendeeManagement
+                data={uiBlock.data}
+                onAttendeesUpdate={onAttendeesUpdate || (() => {})}
+                onContinue={onContinue || (() => {})}
+              />
+            );
+          case 'meeting_approval':
+            return (
+              <MeetingApproval
+                data={uiBlock.data}
+                onApprove={onApprove || (() => {})}
+                onEdit={onEdit || (() => {})}
+              />
+            );
+          case 'agenda_editor':
+            return (
+              <AgendaEditorBlock
+                data={uiBlock.data}
+                onAgendaUpdate={onAgendaUpdate || (() => {})}
+                onAgendaApprove={onAgendaApprove || (() => {})}
+                onAgendaRegenerate={onAgendaRegenerate || (() => {})}
+              />
+            );
+          default:
+            return null;
+        }
+      })()}
+    </div>
+  );
 }

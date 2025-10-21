@@ -14,7 +14,9 @@ import {
   FileText,
   Clock,
   CheckCircle,
-  AlertCircle
+  AlertCircle,
+  Mail,
+  Loader2
 } from 'lucide-react';
 import { Button } from '@/components/ui/button';
 import { Card, CardContent, CardHeader, CardTitle } from '@/components/ui/card';
@@ -37,11 +39,19 @@ export interface AgendaEditorProps {
   onContentChange: (content: string) => void;
   onApprove?: (finalContent: string) => void;
   onRegenerate?: () => void;
+  onSendEmails?: (agenda: string, attendees: string[]) => void;
   editingTools?: Partial<RichTextTools>;
   className?: string;
   disabled?: boolean;
   showPreview?: boolean;
   maxLength?: number;
+  attendees?: string[];
+  isSending?: boolean;
+  sendingStatus?: {
+    sent: number;
+    total: number;
+    errors: number;
+  };
 }
 
 export function AgendaEditor({
@@ -49,11 +59,15 @@ export function AgendaEditor({
   onContentChange,
   onApprove,
   onRegenerate,
+  onSendEmails,
   editingTools = {},
   className,
   disabled = false,
   showPreview = true,
-  maxLength = 2000
+  maxLength = 2000,
+  attendees = [],
+  isSending = false,
+  sendingStatus
 }: AgendaEditorProps) {
   const [content, setContent] = useState(initialContent);
   const [activeTools, setActiveTools] = useState<RichTextTools>({
@@ -64,7 +78,7 @@ export function AgendaEditor({
     numberedList: false,
     ...editingTools
   });
-  const [currentTab, setCurrentTab] = useState<'edit' | 'preview'>('edit');
+  const [currentTab, setCurrentTab] = useState<'edit' | 'preview'>('preview');
   const [hasChanges, setHasChanges] = useState(false);
   const [validationResult, setValidationResult] = useState<{
     isValid: boolean;
@@ -528,6 +542,62 @@ export function AgendaEditor({
           <p>• Use # for headers (# Main, ## Sub, ### Detail)</p>
           <p>• Use - [ ] for checkboxes and - [x] for completed items</p>
           <p>• Add time allocations like "(15 min)" for better planning</p>
+        </div>
+
+        {/* Action Buttons */}
+        <div className="flex flex-wrap gap-3 pt-4 border-t">
+          {onApprove && (
+            <Button
+              onClick={handleSave}
+              disabled={disabled || !validationResult.isValid}
+              className="bg-green-600 hover:bg-green-700"
+            >
+              <CheckCircle className="h-4 w-4 mr-2" />
+              Approve Agenda
+            </Button>
+          )}
+
+          {onRegenerate && (
+            <Button
+              variant="outline"
+              onClick={onRegenerate}
+              disabled={disabled || isSending}
+            >
+              <RotateCcw className="h-4 w-4 mr-2" />
+              Regenerate
+            </Button>
+          )}
+
+          {onSendEmails && attendees.length > 0 && (
+            <Button
+              onClick={() => onSendEmails(content, attendees)}
+              disabled={disabled || isSending || !validationResult.isValid}
+              className="bg-blue-600 hover:bg-blue-700"
+            >
+              {isSending ? (
+                <>
+                  <Loader2 className="h-4 w-4 mr-2 animate-spin" />
+                  Sending ({sendingStatus?.sent || 0}/{sendingStatus?.total || 0})
+                </>
+              ) : (
+                <>
+                  <Mail className="h-4 w-4 mr-2" />
+                  Send to {attendees.length} Attendee{attendees.length > 1 ? 's' : ''}
+                </>
+              )}
+            </Button>
+          )}
+
+          {hasChanges && (
+            <Button
+              variant="outline"
+              onClick={handleReset}
+              disabled={disabled}
+            >
+              <RotateCcw className="h-4 w-4 mr-2" />
+              Reset
+            </Button>
+          )}
         </div>
       </CardContent>
     </Card>

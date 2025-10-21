@@ -57,6 +57,30 @@ Context: "{context}"
 
 Rules: <6 words, specific, action-focused, no "meeting"/"discussion"`,
 
+  // Purpose enhancement and expansion prompt
+  PURPOSE_ENHANCEMENT: `Enhance and expand the meeting purpose into detailed, professional wording.
+
+Brief Purpose: "{purpose}"
+Meeting Title: "{title}"
+Participants: {participants}
+Context: "{context}"
+
+JSON only:
+{
+ "enhancedPurpose": "2-3 sentence professional description",
+ "keyPoints": ["point1", "point2", "point3"]
+}
+
+Guidelines:
+- Expand the brief purpose into clear, professional language
+- Include key objectives or discussion points
+- Keep it concise but descriptive (2-3 sentences max)
+- Make it suitable for a calendar event description
+- Extract 3 key points from the expanded purpose
+- Handle complex technical purposes with multiple clauses
+- Focus on the core meeting objective while preserving all important details
+- Use professional but accessible language`,
+
   // Compressed attendee verification prompt
   ATTENDEE_VERIFICATION: `Verify emails: {emails}
 

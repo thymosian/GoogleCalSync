@@ -4,11 +4,17 @@ import { BusinessRulesEngine } from './businessRules.js';
 import { AttendeeValidator } from './attendeeValidator.js';
 import { performanceMonitor } from './performanceMonitor.js';
 import { ErrorLoggingIntegration } from './errorHandlers/errorLoggingIntegration.js';
+import { generateDynamicResponse, ResponseContext } from './dynamicResponseGenerator.js';
 import type { ConversationMessage, MeetingData, UIBlock } from '../shared/schema.js';
+
+export interface ConversationalUIBlock {
+    type: 'meeting_type_selection' | 'attendee_management' | 'meeting_approval' | 'agenda_editor';
+    data: Record<string, any>;
+}
 
 export interface ChatWorkflowResponse {
     message: string;
-    uiBlock?: UIBlock;
+    uiBlock?: ConversationalUIBlock;
     conversationId: string;
     workflow: {
         currentStep: string;
@@ -82,7 +88,7 @@ export class WorkflowChatIntegration {
                 }
             } catch (error) {
                 console.warn('Meeting intent detection failed, continuing with regular processing:', error);
-                
+
                 // Log error to comprehensive error logging system
                 await ErrorLoggingIntegration.logWorkflowError(error, {
                     workflowStep: 'intent_detection',
@@ -92,7 +98,48 @@ export class WorkflowChatIntegration {
                 }).catch(logErr => {
                     console.error('Failed to log intent detection error:', logErr);
                 });
-                
+
+                // If AI service is unavailable, provide fallback response with dynamic generation
+                if (error instanceof Error && error.message.includes('Gemini service temporarily unavailable')) {
+                    const workflowState = { currentStep: 'meeting_type_selection', meetingData: {} };
+                    const dynamicMessage = await this.generateDynamicResponse(
+                        workflowState,
+                        contextEngine,
+                        'fallback',
+                        { reason: 'ai_service_unavailable' }
+                    );
+
+                    return {
+                        message: dynamicMessage,
+                        uiBlock: undefined,
+                        conversationId: contextEngine.getConversationId() || 'fallback',
+                        workflow: {
+                            currentStep: 'meeting_type_selection',
+                            requiresUserInput: false,
+                            progress: 0,
+                            meetingData: {},
+                            isComplete: false,
+                            nextAction: 'Continue with workflow'
+                        },
+                        validation: {
+                            errors: [],
+                            warnings: ['AI service temporarily unavailable, using fallback mode']
+                        },
+                        contextStats: {
+                            messageCount: 0,
+                            tokenCount: 0,
+                            compressionLevel: 0,
+                            currentMode: 'scheduling',
+                            hasMeetingData: false
+                        },
+                        performance: {
+                            tokenEfficiency: 0,
+                            compressionEffectiveness: 0,
+                            optimizationRecommendations: []
+                        }
+                    };
+                }
+
                 // Continue with regular processing if intent detection fails
             }
         }
@@ -167,7 +214,7 @@ export class WorkflowChatIntegration {
 
         return {
             message: workflowResponse.message,
-            uiBlock: workflowResponse.uiBlock as any, // Cast to avoid type issues - functionality works
+            uiBlock: workflowResponse.uiBlock as ConversationalUIBlock,
             conversationId: contextEngine.getConversationId() || 'unknown',
             workflow: {
                 currentStep: workflowResponse.nextStep,
@@ -210,9 +257,37 @@ export class WorkflowChatIntegration {
     ): Promise<any> {
         // Import the extractMeetingIntent function
         const { extractMeetingIntent } = await import('./aiInterface.js');
-        
+
         // Call the AI extraction function with conversation context
         return await extractMeetingIntent(message, conversationContext);
+    }
+
+    /**
+     * Generate dynamic, context-aware responses using Mistral
+     */
+    private async generateDynamicResponse(
+        workflowState: any,
+        context: ConversationContextEngine,
+        responseType: 'meeting_type_selection' | 'meeting_created' | 'error' | 'fallback',
+        additionalContext?: any
+    ): Promise<string> {
+        const currentStep = workflowState.currentStep;
+        const meetingData = workflowState.meetingData;
+
+        // Build context for Mistral
+        const responseContext: ResponseContext = {
+            currentStep,
+            meetingData,
+            hasTitle: !!meetingData.title,
+            hasTime: !!(meetingData.startTime && meetingData.endTime),
+            hasAttendees: !!(meetingData.attendees && meetingData.attendees.length > 0),
+            meetingType: meetingData.type,
+            isOnline: meetingData.type === 'online',
+            attendeeCount: meetingData.attendees?.length || 0,
+            additionalContext
+        };
+
+        return await generateDynamicResponse(responseType, responseContext);
     }
 
     /**
@@ -297,13 +372,22 @@ export class WorkflowChatIntegration {
         let workflowResponse = await orchestrator.processMessage(conversationMessage);
 
         // Auto-advance through non-interactive steps (calendar_access_verification)
-        while (!workflowResponse.requiresUserInput && 
+        // Stop auto-advance when we reach meeting_type_selection since it requires UI interaction
+        while (!workflowResponse.requiresUserInput &&
                workflowResponse.nextStep !== 'meeting_type_selection' &&
+               workflowResponse.nextStep !== 'agenda_approval' &&
+               workflowResponse.nextStep !== 'approval' &&
                workflowResponse.nextStep !== orchestrator.getWorkflowState().currentStep) {
             console.log(`Auto-advancing from ${orchestrator.getWorkflowState().currentStep} to ${workflowResponse.nextStep}...`);
             try {
                 const advanceResponse = await orchestrator.advanceToStep(workflowResponse.nextStep);
                 workflowResponse = advanceResponse;
+
+                // If we've reached a step that requires user input, stop auto-advancing
+                if (workflowResponse.requiresUserInput || workflowResponse.uiBlock) {
+                    console.log(`Stopping auto-advance at ${workflowResponse.nextStep} - requires user input or has UI block`);
+                    break;
+                }
             } catch (error) {
                 console.warn('Auto-advance failed:', error);
                 break;
@@ -337,7 +421,7 @@ export class WorkflowChatIntegration {
 
         return {
             message: workflowResponse.message,
-            uiBlock: workflowResponse.uiBlock as any, // Cast to avoid type issues - functionality works
+            uiBlock: workflowResponse.uiBlock as ConversationalUIBlock,
             conversationId: contextEngine.getConversationId() || 'unknown',
             workflow: {
                 currentStep: workflowResponse.nextStep,
@@ -553,8 +637,7 @@ export class WorkflowChatIntegration {
                     contextEngine.updateMeetingData(meetingTypeData);
 
                     const nextStep = 'time_date_collection'; // Always go to time collection first
-                    workflowResponse = await orchestrator.processStepTransition(
-                        'meeting_type_selection',
+                    workflowResponse = await orchestrator.advanceToStep(
                         nextStep as any,
                         meetingTypeData
                     );
@@ -570,15 +653,13 @@ export class WorkflowChatIntegration {
                     contextEngine.updateMeetingData(attendeeData);
 
                     // Stay in attendee collection step for further updates
-                    workflowResponse = await orchestrator.processStepTransition(
-                        'attendee_collection',
+                    workflowResponse = await orchestrator.advanceToStep(
                         'attendee_collection',
                         attendeeData
                     );
                 } else if (blockData.action === 'continue') {
                     // Continue to next step after attendee collection
-                    workflowResponse = await orchestrator.processStepTransition(
-                        'attendee_collection',
+                    workflowResponse = await orchestrator.advanceToStep(
                         'meeting_details_collection'
                     );
                 } else {
@@ -609,8 +690,7 @@ export class WorkflowChatIntegration {
                     const validation = await attendeeValidator.validateEmail(blockData.email, user);
 
                     // Stay in attendee collection step for further updates
-                    workflowResponse = await orchestrator.processStepTransition(
-                        'attendee_collection',
+                    workflowResponse = await orchestrator.advanceToStep(
                         'attendee_collection',
                         attendeeData
                     );
@@ -623,15 +703,13 @@ export class WorkflowChatIntegration {
                     contextEngine.updateMeetingData(attendeeData);
 
                     // Stay in attendee collection step for further updates
-                    workflowResponse = await orchestrator.processStepTransition(
-                        'attendee_collection',
+                    workflowResponse = await orchestrator.advanceToStep(
                         'attendee_collection',
                         attendeeData
                     );
                 } else if (blockData.action === 'continue') {
                     // Continue to next step after attendee collection
-                    workflowResponse = await orchestrator.processStepTransition(
-                        'attendee_collection',
+                    workflowResponse = await orchestrator.advanceToStep(
                         'meeting_details_collection'
                     );
                 } else {
@@ -708,8 +786,7 @@ export class WorkflowChatIntegration {
                     }
                 } else if (blockData.action === 'edit') {
                     // Return to meeting details collection for editing
-                    workflowResponse = await orchestrator.processStepTransition(
-                        'approval',
+                    workflowResponse = await orchestrator.advanceToStep(
                         'meeting_details_collection'
                     );
                 } else {
@@ -778,7 +855,7 @@ export class WorkflowChatIntegration {
 
         return {
             message: workflowResponse.message,
-            uiBlock: workflowResponse.uiBlock as any, // Cast to avoid type issues - functionality works
+            uiBlock: workflowResponse.uiBlock as ConversationalUIBlock,
             conversationId: contextEngine.getConversationId() || 'unknown',
             workflow: {
                 currentStep: workflowResponse.nextStep,
@@ -1213,8 +1290,8 @@ export class WorkflowChatIntegration {
     }
 
     /**
-     * Gets or creates a workflow orchestrator for a conversation
-     */
+      * Gets or creates a workflow orchestrator for a conversation with state restoration
+      */
     private async getOrCreateOrchestrator(
         userId: string,
         conversationId?: string,
@@ -1227,6 +1304,9 @@ export class WorkflowChatIntegration {
             return this.orchestratorCache.get(actualConversationId)!;
         }
 
+        // Try to restore workflow state from persistence
+        const restoredState = await this.retrieveWorkflowState(userId, conversationId);
+
         // Create new orchestrator
         const businessRules = new BusinessRulesEngine();
         const attendeeValidator = new AttendeeValidator();
@@ -1236,6 +1316,30 @@ export class WorkflowChatIntegration {
             attendeeValidator,
             user
         );
+
+        // Restore state if available
+        if (restoredState) {
+            try {
+                // Update orchestrator state with persisted data
+                const currentState = orchestrator.getWorkflowState();
+                if (restoredState.currentStep) {
+                    currentState.currentStep = restoredState.currentStep;
+                }
+                if (restoredState.meetingData) {
+                    currentState.meetingData = { ...currentState.meetingData, ...restoredState.meetingData };
+                }
+                if (restoredState.isComplete !== undefined) {
+                    currentState.isComplete = restoredState.isComplete;
+                }
+                if (restoredState.errors) {
+                    currentState.errors = restoredState.errors;
+                }
+
+                console.log(`Restored workflow state for user ${userId}, step: ${restoredState.currentStep}`);
+            } catch (error) {
+                console.warn('Failed to restore workflow state, using default:', error);
+            }
+        }
 
         this.orchestratorCache.set(actualConversationId, orchestrator);
         return orchestrator;

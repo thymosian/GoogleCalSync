@@ -298,6 +298,179 @@ Rules:
 }
 
 /**
+ * Generate meeting titles using Mistral
+ * Returns title suggestions for a meeting purpose
+ */
+export async function generateMeetingTitles(
+    purpose: string,
+    participants: string[] = [],
+    context: string = ''
+): Promise<{ suggestions: string[]; context: string }> {
+    if (!isMistralAvailable()) {
+        throw new Error('Mistral service is not available. Please check MISTRAL_API_KEY configuration.');
+    }
+
+    const titlePrompt = `Generate 3 concise meeting titles (under 6 words each) for this purpose. Respond with JSON only.
+
+Purpose: "${purpose}"
+Participants: ${participants.join(', ') || 'Not specified'}
+Context: "${context}"
+
+{
+  "suggestions": ["Title1", "Title2", "Title3"],
+  "context": "brief explanation"
+}`;
+
+    const startTime = Date.now();
+    const inputTokens = performanceMonitor.estimateTokenCount(titlePrompt);
+
+    try {
+        const messages: MistralMessage[] = [
+            { role: 'system', content: 'You are a meeting title generation assistant. Respond only with valid JSON.' },
+            { role: 'user', content: titlePrompt }
+        ];
+
+        const response = await mistralClient!.chat.complete({
+            model: defaultConfig.model,
+            messages: messages,
+            temperature: 0.2, // Low temperature for consistent title generation
+            maxTokens: 200,
+            topP: 0.8
+        });
+
+        const rawContent = response.choices?.[0]?.message?.content || '';
+        const content = typeof rawContent === 'string' ? rawContent.trim() : '';
+        const outputTokens = performanceMonitor.estimateTokenCount(content);
+        const responseTime = Date.now() - startTime;
+
+        // Log successful call
+        logSuccessfulCall('meeting_title_generation', inputTokens, outputTokens, responseTime, defaultConfig.model);
+
+        try {
+            // Clean JSON response by removing markdown code blocks
+            let cleaned = content.replace(/```json\s*/g, '').replace(/```\s*/g, '').trim();
+            const jsonMatch = cleaned.match(/\{[\s\S]*\}|\[[\s\S]*\]/);
+            if (jsonMatch) {
+                cleaned = jsonMatch[0];
+            }
+
+            const titleData = JSON.parse(cleaned);
+            return {
+                suggestions: titleData.suggestions || ["Team Meeting", "Discussion Session", "Project Sync"],
+                context: titleData.context || "General meeting"
+            };
+        } catch (parseError) {
+            console.error('Failed to parse title suggestions JSON:', content);
+            // Return default suggestions if parsing fails
+            return {
+                suggestions: ["Team Meeting", "Discussion Session", "Project Sync"],
+                context: "General meeting"
+            };
+        }
+    } catch (error: any) {
+        const responseTime = Date.now() - startTime;
+        const errorMessage = error.message || 'Unknown Mistral API error';
+
+        // Log failed call
+        logFailedCall('meeting_title_generation', inputTokens, responseTime, errorMessage, defaultConfig.model);
+
+        console.error('Error generating meeting titles with Mistral:', error);
+        throw handleMistralError(error, 'meeting_title_generation');
+    }
+}
+
+/**
+ * Enhance and expand meeting purpose into detailed wording using Mistral
+ */
+export async function enhancePurposeWording(
+    purpose: string,
+    title: string,
+    participants: string[] = [],
+    context: string = ''
+): Promise<{ enhancedPurpose: string; keyPoints: string[] }> {
+    if (!isMistralAvailable()) {
+        throw new Error('Mistral service is not available. Please check MISTRAL_API_KEY configuration.');
+    }
+
+    const purposePrompt = `Enhance and expand this meeting purpose into a detailed, professional description.
+
+Brief Purpose: "${purpose}"
+Meeting Title: "${title}"
+Participants: ${participants.join(', ') || 'Not specified'}
+Context: "${context}"
+
+Respond with JSON only:
+{
+  "enhancedPurpose": "2-3 sentence professional description",
+  "keyPoints": ["point1", "point2", "point3"]
+}
+
+Guidelines:
+- Expand the brief purpose into clear, professional language
+- Include key objectives or discussion points
+- Keep it concise but descriptive (2-3 sentences max)
+- Make it suitable for a calendar event description
+- Extract 3 key points from the expanded purpose`;
+
+    const startTime = Date.now();
+    const inputTokens = performanceMonitor.estimateTokenCount(purposePrompt);
+
+    try {
+        const messages: MistralMessage[] = [
+            { role: 'system', content: 'You are a purpose enhancement assistant. Respond only with valid JSON.' },
+            { role: 'user', content: purposePrompt }
+        ];
+
+        const response = await mistralClient!.chat.complete({
+            model: defaultConfig.model,
+            messages: messages,
+            temperature: 0.3, // Slightly creative for better wording
+            maxTokens: 500,
+            topP: 0.8
+        });
+
+        const rawContent = response.choices?.[0]?.message?.content || '';
+        const content = typeof rawContent === 'string' ? rawContent.trim() : '';
+        const outputTokens = performanceMonitor.estimateTokenCount(content);
+        const responseTime = Date.now() - startTime;
+
+        // Log successful call
+        logSuccessfulCall('purpose_enhancement', inputTokens, outputTokens, responseTime, defaultConfig.model);
+
+        try {
+            // Clean JSON response by removing markdown code blocks
+            let cleaned = content.replace(/```json\s*/g, '').replace(/```\s*/g, '').trim();
+            const jsonMatch = cleaned.match(/\{[\s\S]*\}|\[[\s\S]*\]/);
+            if (jsonMatch) {
+                cleaned = jsonMatch[0];
+            }
+
+            const parsed = JSON.parse(cleaned);
+            return {
+                enhancedPurpose: parsed.enhancedPurpose || purpose,
+                keyPoints: Array.isArray(parsed.keyPoints) ? parsed.keyPoints : []
+            };
+        } catch (parseError) {
+            console.error('Failed to parse purpose enhancement JSON:', content);
+            // Return fallback if JSON parsing fails
+            return {
+                enhancedPurpose: purpose,
+                keyPoints: []
+            };
+        }
+    } catch (error: any) {
+        const responseTime = Date.now() - startTime;
+        const errorMessage = error.message || 'Unknown Mistral API error';
+
+        // Log failed call
+        logFailedCall('purpose_enhancement', inputTokens, responseTime, errorMessage, defaultConfig.model);
+
+        console.error('Error enhancing purpose with Mistral:', error);
+        throw handleMistralError(error, 'purpose_enhancement');
+    }
+}
+
+/**
  * Get usage metrics for monitoring
  */
 export function getUsageMetrics(): {

@@ -199,35 +199,9 @@ export class AttendeeValidator {
                 return result;
             }
 
-            // If not found in contacts, try to get person info directly
-            try {
-                const personResponse = await people.people.get({
-                    resourceName: `people/${email}`,
-                    personFields: 'names,emailAddresses,photos'
-                });
-
-                if (personResponse.data) {
-                    const person = personResponse.data;
-                    const primaryName = person.names?.[0];
-                    const primaryPhoto = person.photos?.[0];
-
-                    const result: EmailValidationResult = {
-                        email,
-                        isValid: true,
-                        exists: true,
-                        firstName: primaryName?.givenName || undefined,
-                        lastName: primaryName?.familyName || undefined,
-                        profilePicture: primaryPhoto?.url || undefined,
-                        isGoogleUser: true
-                    };
-
-                    this.setCacheResult(email, result);
-                    return result;
-                }
-            } catch (directLookupError) {
-                // Direct lookup failed, but email format is valid
-                console.log(`Direct lookup failed for ${email}:`, directLookupError);
-            }
+            // Note: Direct person lookup by email is not supported by Google People API
+            // The searchContacts method above is the correct approach
+            console.log(`Person not found in contacts for ${email}, but email format is valid`);
 
             // Email format is valid but person not found in Google
             const result: EmailValidationResult = {

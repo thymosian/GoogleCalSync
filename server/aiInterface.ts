@@ -7,12 +7,16 @@
 
 import {
     extractMeetingIntent as extractMeetingIntentDirect,
-    generateMeetingTitles as generateMeetingTitlesDirect,
     generateMeetingAgenda as generateMeetingAgendaDirect,
     generateActionItems as generateActionItemsDirect,
     getGeminiResponse as getGeminiResponseDirect,
     verifyAttendees as verifyAttendeesDirect
 } from './gemini.js';
+import {
+    generateMeetingTitles as generateMeetingTitlesMistral,
+    enhancePurposeWording as enhancePurposeWordingMistral
+} from './mistralService.js';
+import { aiRouter } from './aiRouterService.js';
 import { MeetingExtraction, TitleSuggestion, ConversationMessage, MeetingData } from '../shared/schema.js';
 
 // Re-export types for convenience
@@ -35,14 +39,40 @@ export async function extractMeetingIntent(
 }
 
 /**
- * Generate meeting titles - FAST PATH (direct Gemini call)
+ * Generate meeting titles - Using AI router (Gemini primary, Mistral fallback)
  */
 export async function generateMeetingTitles(
     purpose: string,
     participants: string[],
     context: string = ''
 ): Promise<TitleSuggestion> {
-    return generateMeetingTitlesDirect(purpose, participants, context);
+    try {
+        // Use AI router to respect routing configuration (Gemini primary, Mistral fallback)
+        return await aiRouter.routeRequest<TitleSuggestion>('generateMeetingTitles', [purpose, participants, context]);
+    } catch (error) {
+        console.error('AI router failed for generateMeetingTitles, falling back to direct Mistral call:', error);
+        // Fallback to direct Mistral call if router fails
+        return generateMeetingTitlesMistral(purpose, participants, context);
+    }
+}
+
+/**
+ * Enhance purpose wording - Using AI router (Gemini primary, Mistral fallback)
+ */
+export async function enhancePurposeWording(
+    purpose: string,
+    title: string,
+    participants: string[] = [],
+    context: string = ''
+): Promise<{ enhancedPurpose: string; keyPoints: string[] }> {
+    try {
+        // Use AI router to respect routing configuration (Gemini primary, Mistral fallback)
+        return await aiRouter.routeRequest<{ enhancedPurpose: string; keyPoints: string[] }>('enhancePurposeWording', [purpose, title, participants, context]);
+    } catch (error) {
+        console.error('AI router failed for enhancePurposeWording, falling back to direct Mistral call:', error);
+        // Fallback to direct Mistral call if router fails
+        return enhancePurposeWordingMistral(purpose, title, participants, context);
+    }
 }
 
 /**

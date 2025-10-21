@@ -409,6 +409,8 @@ export class AIRouterService {
                 return geminiService.extractMeetingIntent(...args);
             case 'generateMeetingTitles':
                 return geminiService.generateMeetingTitles(...args);
+            case 'enhancePurposeWording':
+                return geminiService.enhancePurposeWording(...args);
             case 'generateMeetingAgenda':
                 return geminiService.generateMeetingAgenda(...args);
             case 'generateActionItems':
@@ -417,6 +419,9 @@ export class AIRouterService {
                 return geminiService.getGeminiResponse(...args);
             case 'verifyAttendees':
                 return geminiService.verifyAttendees(...args);
+            case 'extractTimeFromNaturalLanguage':
+                const { extractTimeFromNaturalLanguage: geminiTimeExtractor } = await import('./geminiTimeExtractor.js');
+                return geminiTimeExtractor(args[0], args[1]);
             default:
                 throw new Error(`Unknown function: ${functionName}`);
         }
@@ -433,9 +438,15 @@ export class AIRouterService {
                 return mistralService.verifyAttendees(...args);
             case 'generateBasicResponse':
                 return mistralService.generateBasicResponse(...args);
+            case 'generateMeetingTitles':
+                return mistralService.generateMeetingTitles(...args);
+            case 'enhancePurposeWording':
+                return mistralService.enhancePurposeWording(...args);
+            case 'extractTimeFromNaturalLanguage':
+                const { extractTimeFromNaturalLanguage: mistralTimeExtractor } = await import('./mistralTimeExtractor.js');
+                return mistralTimeExtractor(args[0], args[1]);
             // For complex functions, fallback to basic response generation
             case 'extractMeetingIntent':
-            case 'generateMeetingTitles':
             case 'generateMeetingAgenda':
             case 'generateActionItems':
                 // These will be handled by fallback logic or throw appropriate errors

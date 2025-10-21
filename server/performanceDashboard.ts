@@ -4,7 +4,7 @@
  */
 
 import { performanceMonitor } from './performanceMonitor';
-import { cacheManager } from './cachingService';
+import { cachingService } from './cachingService';
 import { databaseOptimizer } from './databaseOptimizer';
 import { attendeeValidator } from './attendeeValidator';
 import { conversationStorage } from './conversationStorage';
@@ -84,14 +84,13 @@ export class PerformanceDashboard {
    */
   async getSystemMetrics(): Promise<SystemPerformanceMetrics> {
     const aiStats = performanceMonitor.getPerformanceStats(1); // Last hour
-    const cacheStats = cacheManager.getAllStats();
+    const cacheStats = cachingService.getStats();
     const dbStats = databaseOptimizer.getPerformanceMetrics();
     const attendeeStats = attendeeValidator.getPerformanceMetrics();
     const conversationStats = conversationStorage.getQueryPerformanceMetrics();
 
-    // Calculate total memory usage across all caches
-    const totalMemoryUsage = Object.values(cacheStats)
-      .reduce((total, stats) => total + stats.memoryUsage, 0);
+    // Calculate total memory usage across all caches (approximate based on cache size)
+    const totalMemoryUsage = cacheStats.size * 1024; // Rough estimate: 1KB per entry
 
     const metrics: SystemPerformanceMetrics = {
       timestamp: new Date(),
@@ -286,7 +285,7 @@ export class PerformanceDashboard {
 
     // Get recommendations from individual services
     const aiRecommendations = performanceMonitor.getOptimizationRecommendations();
-    const cacheRecommendations = cacheManager.getOptimizationRecommendations();
+    const cacheStats = cachingService.getStats();
     const dbRecommendations = databaseOptimizer.getOptimizationRecommendations();
 
     // Convert AI recommendations
@@ -299,15 +298,15 @@ export class PerformanceDashboard {
       });
     });
 
-    // Convert cache recommendations
-    cacheRecommendations.forEach(rec => {
+    // Add cache recommendations if cache is getting full
+    if (cacheStats.size > 500) {
       recommendations.push({
         category: 'cache' as const,
-        priority: rec.priority,
-        description: rec.description,
-        estimatedImpact: `Improve ${rec.type} from ${rec.currentValue} to ${rec.recommendedValue}`
+        priority: 'medium',
+        description: 'Cache is accumulating many entries',
+        estimatedImpact: `Current cache size: ${cacheStats.size} entries. Consider running cleanup.`
       });
-    });
+    }
 
     // Convert database recommendations
     dbRecommendations.forEach(rec => {

@@ -80,23 +80,24 @@ export function CalendarSidebar({ events, onDeleteEvent, onEventClick }: Calenda
 
   return (
     <>
-      <div className="space-y-4">
+      <div className="space-y-4 h-full flex flex-col">
         {/* Fixed header */}
-        <div className="sticky top-0 bg-card z-10 pb-2 border-b">
+        <div className="sticky top-0 bg-card z-10 pb-2 border-b flex-shrink-0">
           <h2 className="text-lg font-semibold flex items-center gap-2">
             <Calendar className="h-5 w-5" />
             Upcoming Events
           </h2>
         </div>
         
-        <div className="space-y-4">
-          {Object.entries(groupedEvents).length > 0 ? (
-            Object.entries(groupedEvents).map(([dateKey, dayEvents]) => (
-              <div key={dateKey} className="space-y-2">
-                <h3 className="text-sm font-medium text-muted-foreground px-2">
-                  {getEventDateLabel(new Date(dayEvents[0].startTime))}
-                </h3>
-                {dayEvents.map((event) => (
+        <div className="flex-1 overflow-y-auto pr-2">
+          <div className="space-y-4">
+            {Object.entries(groupedEvents).length > 0 ? (
+              Object.entries(groupedEvents).map(([dateKey, dayEvents]) => (
+                <div key={dateKey} className="space-y-2">
+                  <h3 className="text-sm font-medium text-muted-foreground px-2">
+                    {getEventDateLabel(new Date(dayEvents[0].startTime))}
+                  </h3>
+                  {dayEvents.map((event) => (
                   <Collapsible
                     key={event.id}
                     open={openEvent === event.id}
@@ -203,15 +204,16 @@ export function CalendarSidebar({ events, onDeleteEvent, onEventClick }: Calenda
                     </div>
                   </Collapsible>
                 ))}
+                </div>
+              ))
+            ) : (
+              <div className="text-center py-8 text-muted-foreground">
+                <Calendar className="h-8 w-8 mx-auto mb-2 opacity-50" />
+                <p className="text-sm">No upcoming events</p>
+                <p className="text-xs mt-1">Your calendar events will appear here once you add them</p>
               </div>
-            ))
-          ) : (
-            <div className="text-center py-8 text-muted-foreground">
-              <Calendar className="h-8 w-8 mx-auto mb-2 opacity-50" />
-              <p className="text-sm">No upcoming events</p>
-              <p className="text-xs mt-1">Your calendar events will appear here once you add them</p>
-            </div>
-          )}
+            )}
+          </div>
         </div>
       </div>
 

@@ -69,7 +69,13 @@ export async function createCalendarEvent(user: User, event: any, meetingType?: 
     // Determine if we should create a Google Meet link
     // Auto-generate for online meetings or when explicitly requested
     const shouldCreateMeetLink = meetingType === 'online' || event.createMeetLink === true;
-    
+
+    // Add debug logging to see what's being sent to Google Calendar
+    console.log('Creating calendar event with description:', event.description);
+    console.log('Event title:', event.title);
+    console.log('Event description length:', event.description?.length || 0);
+    console.log('Event description preview:', event.description?.substring(0, 100) + '...' || 'No description');
+
     const newEvent: any = {
       summary: event.title,
       description: event.description,

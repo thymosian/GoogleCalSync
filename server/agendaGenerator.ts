@@ -6,6 +6,7 @@ export interface AgendaContent {
   duration: number;
   topics: AgendaTopic[];
   actionItems: ActionItem[];
+  enhancedPurpose?: string;
 }
 
 export interface AgendaTopic {
@@ -43,12 +44,13 @@ export type MeetingType = 'general' | 'standup' | 'planning' | 'review' | 'brain
 
 export class AgendaGenerator {
   /**
-   * Generate agenda based on meeting data and conversation context
-   */
-  async generateAgenda(
-    meetingData: MeetingData,
-    conversationContext: ConversationMessage[] = []
-  ): Promise<AgendaContent> {
+    * Generate agenda based on meeting data and conversation context
+    */
+   async generateAgenda(
+     meetingData: MeetingData,
+     conversationContext: ConversationMessage[] = [],
+     enhancedPurpose?: string
+   ): Promise<AgendaContent> {
     try {
       // Extract comprehensive context from conversation
       const contextAnalysis = this.analyzeConversationContext(conversationContext);
@@ -75,15 +77,18 @@ export class AgendaGenerator {
       if (!validationResult.isValid) {
         console.warn('Generated agenda validation failed:', validationResult.errors);
         // Try to fix common issues
-        return this.enhanceAgendaContent(agendaContent, contextAnalysis, duration);
+        return this.enhanceAgendaContent(agendaContent, contextAnalysis, duration, enhancedPurpose);
       }
-      
-      return agendaContent;
+
+      return {
+        ...agendaContent,
+        enhancedPurpose
+      };
     } catch (error) {
-      console.error('Error generating agenda:', error);
-      // Return enhanced fallback agenda
-      return this.createEnhancedFallbackAgenda(meetingData, conversationContext);
-    }
+       console.error('Error generating agenda:', error);
+       // Return enhanced fallback agenda
+       return this.createEnhancedFallbackAgenda(meetingData, conversationContext, enhancedPurpose);
+     }
   }
 
   /**
@@ -699,13 +704,14 @@ Requirements:
   }
 
   /**
-   * Enhance agenda content with validation fixes
-   */
-  private enhanceAgendaContent(
-    content: AgendaContent, 
-    contextAnalysis: ConversationAnalysis, 
-    duration: number
-  ): AgendaContent {
+    * Enhance agenda content with validation fixes
+    */
+   private enhanceAgendaContent(
+     content: AgendaContent,
+     contextAnalysis: ConversationAnalysis,
+     duration: number,
+     enhancedPurpose?: string
+   ): AgendaContent {
     // Ensure minimum content quality
     if (content.topics.length === 0) {
       content.topics = [
@@ -724,18 +730,22 @@ Requirements:
     }
     
     // Adjust durations
-    this.adjustTopicDurations(content.topics, duration);
-    
-    return content;
+     this.adjustTopicDurations(content.topics, duration);
+
+     return {
+       ...content,
+       enhancedPurpose
+     };
   }
 
   /**
-   * Create enhanced fallback agenda when AI generation fails
-   */
-  private createEnhancedFallbackAgenda(
-    meetingData: MeetingData,
-    conversationContext: ConversationMessage[]
-  ): AgendaContent {
+    * Create enhanced fallback agenda when AI generation fails
+    */
+   private createEnhancedFallbackAgenda(
+     meetingData: MeetingData,
+     conversationContext: ConversationMessage[],
+     enhancedPurpose?: string
+   ): AgendaContent {
     const contextAnalysis = this.analyzeConversationContext(conversationContext);
     const duration = meetingData.startTime && meetingData.endTime 
       ? Math.round((meetingData.endTime.getTime() - meetingData.startTime.getTime()) / (1000 * 60))
@@ -795,11 +805,12 @@ Requirements:
     }
     
     return {
-      title: meetingData.title || contextAnalysis.purpose || 'Meeting Agenda',
-      duration,
-      topics,
-      actionItems
-    };
+       title: meetingData.title || contextAnalysis.purpose || 'Meeting Agenda',
+       duration,
+       topics,
+       actionItems,
+       enhancedPurpose
+     };
   }
 
   /**
