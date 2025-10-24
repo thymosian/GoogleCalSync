@@ -258,7 +258,49 @@ export function AgendaEditor({
 
   // Render markdown-like preview
   const renderPreview = (text: string): string => {
-    return text
+    // First, split into lines and process lists properly
+    const lines = text.split('\n');
+    let result = '';
+    let inBulletList = false;
+    let inNumberedList = false;
+
+    for (let i = 0; i < lines.length; i++) {
+      const line = lines[i];
+
+      if (line.trim().startsWith('• ')) {
+        if (!inBulletList) {
+          result += '<ul>';
+          inBulletList = true;
+          inNumberedList = false;
+        }
+        result += '<li>' + line.substring(2) + '</li>';
+      } else if (line.trim().match(/^\d+\.\s+/)) {
+        if (!inNumberedList) {
+          result += '<ol>';
+          inNumberedList = true;
+          inBulletList = false;
+        }
+        const match = line.match(/^\d+\.\s+(.*)/);
+        result += '<li>' + (match ? match[1] : line) + '</li>';
+      } else {
+        if (inBulletList) {
+          result += '</ul>';
+          inBulletList = false;
+        }
+        if (inNumberedList) {
+          result += '</ol>';
+          inNumberedList = false;
+        }
+        result += line + '<br>';
+      }
+    }
+
+    // Close any open lists
+    if (inBulletList) result += '</ul>';
+    if (inNumberedList) result += '</ol>';
+
+    // Apply other formatting
+    return result
       // Bold text
       .replace(/\*\*(.*?)\*\*/g, '<strong>$1</strong>')
       // Italic text
@@ -270,15 +312,9 @@ export function AgendaEditor({
       .replace(/^### (.*$)/gm, '<h3 style="font-size: 1.1em; font-weight: 600; margin: 1em 0 0.5em 0">$1</h3>')
       .replace(/^## (.*$)/gm, '<h2 style="font-size: 1.2em; font-weight: 600; margin: 1.2em 0 0.6em 0">$1</h2>')
       .replace(/^# (.*$)/gm, '<h1 style="font-size: 1.3em; font-weight: 700; margin: 1.5em 0 0.7em 0">$1</h1>')
-      // Bullet points
-      .replace(/^• (.*$)/gm, '<li style="margin-left: 1em">$1</li>')
-      // Numbered lists
-      .replace(/^\d+\.\s+(.*$)/gm, '<li style="margin-left: 1em; list-style-type: decimal">$1</li>')
       // Checkboxes
       .replace(/^- \[ \] (.*$)/gm, '<div style="margin: 0.5em 0"><input type="checkbox" disabled style="margin-right: 0.5em">$1</div>')
-      .replace(/^- \[x\] (.*$)/gm, '<div style="margin: 0.5em 0"><input type="checkbox" checked disabled style="margin-right: 0.5em">$1</div>')
-      // Line breaks
-      .replace(/\n/g, '<br>');
+      .replace(/^- \[x\] (.*$)/gm, '<div style="margin: 0.5em 0"><input type="checkbox" checked disabled style="margin-right: 0.5em">$1</div>');
   };
 
   const handleSave = () => {
@@ -522,11 +558,11 @@ export function AgendaEditor({
 
           {showPreview && (
             <TabsContent value="preview">
-              <Card className="min-h-[400px] p-6 bg-white">
-                <div 
+              <Card className="min-h-[400px] max-h-[600px] p-6 bg-white overflow-y-auto">
+                <div
                   className="prose prose-sm max-w-none"
-                  dangerouslySetInnerHTML={{ 
-                    __html: renderPreview(content) || '<p class="text-muted-foreground">No content to preview</p>' 
+                  dangerouslySetInnerHTML={{
+                    __html: renderPreview(content) || '<p class="text-muted-foreground">No content to preview</p>'
                   }}
                 />
               </Card>

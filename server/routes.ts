@@ -2469,7 +2469,7 @@ export async function registerRoutes(app: Express): Promise<Server> {
         try {
           const { MeetingWorkflowOrchestrator } = await import('./meetingWorkflowOrchestrator.js');
           const { createConversationContextEngine } = await import('./conversationContext.js');
-          const contextEngine = await createConversationContextEngine({} as any);
+          const contextEngine = await createConversationContextEngine(user.id);
           const businessRules = new BusinessRulesEngine();
           const attendeeValidator = new AttendeeValidator();
 
@@ -2495,7 +2495,7 @@ export async function registerRoutes(app: Express): Promise<Server> {
               isRequired: true
             })) || [],
             agenda: description,
-            meetingLink: createdEvent.meetingLink,
+            meetingLink: createdEvent.meetingLink ?? undefined,
             status: 'created' as const
           };
 
@@ -2891,18 +2891,22 @@ export async function registerRoutes(app: Express): Promise<Server> {
     }
   });
 
-  // Helper function to validate AI response completeness - much more lenient
+  // Helper function to validate AI response completeness - more strict for completeness
   function validateAgendaResponse(response: string, title: string, enhancedPurpose: string): boolean {
     console.log('🔍 Validating agenda response:', {
       length: response.length,
       hasTitle: response.includes(title.substring(0, 20)),
       hasH2: response.includes('<h2>'),
       hasH3: response.includes('<h3>'),
-      hasContent: response.includes('<p>') || response.includes('<ul>') || response.includes('<li>')
+      hasContent: response.includes('<p>') || response.includes('<ul>') || response.includes('<li>'),
+      sectionCount: (response.match(/<h3>/g) || []).length,
+      hasIntroduction: response.toLowerCase().includes('introduction'),
+      hasDiscussion: response.toLowerCase().includes('discussion'),
+      hasAction: response.toLowerCase().includes('action')
     });
 
     // Basic requirements - if these fail, reject
-    if (!response || response.length < 200) {
+    if (!response || response.length < 400) {
       console.warn('❌ Response too short:', response.length, 'characters');
       return false;
     }
@@ -2917,6 +2921,22 @@ export async function registerRoutes(app: Express): Promise<Server> {
       return false;
     }
 
+    // Require at least 3 sections
+    const sectionCount = (response.match(/<h3>/g) || []).length;
+    if (sectionCount < 3) {
+      console.warn('❌ Response missing required sections:', sectionCount, 'found');
+      return false;
+    }
+
+    // Check for key sections
+    const hasIntroduction = response.toLowerCase().includes('introduction');
+    const hasDiscussion = response.toLowerCase().includes('discussion');
+    const hasAction = response.toLowerCase().includes('action');
+    if (!hasIntroduction || !hasDiscussion || !hasAction) {
+      console.warn('❌ Response missing key sections: intro, discussion, action');
+      return false;
+    }
+
     // Check for obviously truncated content
     if (response.endsWith('<') || response.endsWith('&') || response.endsWith('<b>') || response.endsWith('<s') || response.endsWith('<')) {
       console.warn('❌ Response appears to be truncated');
@@ -2928,15 +2948,16 @@ export async function registerRoutes(app: Express): Promise<Server> {
     const closeTags = (response.match(/<\/\w+/g) || []).length;
     const tagDifference = Math.abs(openTags - closeTags);
 
-    if (tagDifference > 15) { // Very high tolerance
-      console.warn('❌ Response has severely mismatched HTML tags:', { openTags, closeTags, difference: tagDifference });
+    if (tagDifference > 10) { // Stricter tolerance
+      console.warn('❌ Response has mismatched HTML tags:', { openTags, closeTags, difference: tagDifference });
       return false;
     }
 
-    // If we get here, the response is probably good enough
-    console.log('✅ Agenda response accepted (lenient validation):', {
+    // If we get here, the response is good
+    console.log('✅ Agenda response accepted (strict validation):', {
       length: response.length,
-      hasBasicStructure: response.includes('<h2>') && (response.includes('<p>') || response.includes('<ul>') || response.includes('<li>'))
+      sections: sectionCount,
+      hasAllSections: hasIntroduction && hasDiscussion && hasAction
     });
 
     return true;
@@ -3134,59 +3155,28 @@ ${meetingLink ? `Participants should use the provided meeting link (${meetingLin
 
       // Generate detailed, comprehensive agenda using AI - optimized for ReactQuill compatibility
       const agendaPrompt = `
-        Create a complete, detailed meeting agenda in HTML format for:
+        Generate a complete meeting agenda in HTML format for:
 
-        MEETING TITLE: "${title}"
-        ENHANCED PURPOSE: "${enhancedPurpose}"
-        DURATION: ${duration || 60} minutes
-        PARTICIPANTS: ${participants?.length || 0} attendees
+        Title: "${title}"
+        Purpose: "${enhancedPurpose}"
+        Duration: ${duration || 60} minutes
+        Attendees: ${participants?.length || 0}
 
-        REQUIRED AGENDA STRUCTURE - Create all 5 sections:
+        Structure the agenda with these sections:
+        1. Introduction (10% of time) - Welcome, objectives, ground rules
+        2. Main Discussion (60% of time) - 3-4 key topics with bullet points, connected to purpose
+        3. Decision Making (15% of time) - Identify decisions, discuss solutions
+        4. Action Items (10% of time) - Deliverables, responsibilities, deadlines
+        5. Logistics (5% of time) - Meeting link: ${meetingLink || 'TBD'}, prep, Q&A
 
-        1. INTRODUCTION SECTION (5 minutes)
-           - Welcome and agenda overview
-           - Meeting objectives from the enhanced purpose
-           - Participant expectations and ground rules
-
-        2. MAIN DISCUSSION SECTION (35 minutes)
-           - Break down the enhanced purpose into 3-4 specific discussion topics
-           - Each topic should have 2-3 bullet points
-           - Include time allocation for each topic
-           - Connect topics directly to the enhanced purpose
-
-        3. DECISION MAKING SECTION (10 minutes)
-           - Identify specific decisions needed based on the enhanced purpose
-           - Discuss challenges and solutions
-           - Build consensus on next steps
-
-        4. ACTION ITEMS SECTION (5 minutes)
-           - Specific deliverables and outcomes
-           - Responsible parties and deadlines
-           - Success metrics and follow-up
-
-        5. MEETING LINK AND LOGISTICS (5 minutes)
-           - Meeting link: ${meetingLink || 'TBD'}
-           - Technical requirements and preparation
-           - Contact information and Q&A
-
-        CRITICAL FORMATTING REQUIREMENTS:
-        - Return ONLY valid HTML FRAGMENT (no markdown, no \`\`\`html, no <html>/<body> tags)
-        - Start directly with: <h2>Meeting Agenda: ${title}</h2>
-        - Use <h3> for all section headings
-        - Use <p> for all paragraphs and text content
-        - Use <ul> and <li> for bullet points (no dashes or asterisks)
-        - Use <strong> for bold text, <em> for italics
-        - Include time allocations like <strong>(10 minutes)</strong>
-        - Ensure total time equals ${duration || 60} minutes
-        - End with meeting link in a separate paragraph
-
-        QUALITY REQUIREMENTS:
-        - Every section must be comprehensive and detailed
-        - All content must directly relate to the enhanced purpose
-        - Include specific, actionable discussion points
-        - Ensure smooth flow between sections
-        - Make it professional and well-structured
-        - Aim for 600-800 words total
+        Requirements:
+        - Start with <h2>Meeting Agenda: ${title}</h2>
+        - Use <h3> for sections, <p> for text, <ul><li> for bullets
+        - Include time allocations in bold
+        - Total time must equal ${duration || 60} minutes
+        - Make it detailed, professional, and directly related to the purpose
+        - Generate the full agenda in one complete response
+        - Aim for 500-700 words
       `;
 
       const messages = [
@@ -3218,7 +3208,7 @@ ${meetingLink ? `Participants should use the provided meeting link (${meetingLin
 
         // Validate response completeness
         const isComplete = validateAgendaResponse(response, title, enhancedPurpose);
-        const isProperLength = response.length > 500; // Minimum expected length for agenda
+        const isProperLength = response.length > 400; // Minimum expected length for agenda
 
         if (isComplete && isProperLength) {
           console.log('✅ AI response is complete and valid');
