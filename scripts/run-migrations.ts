@@ -1,4 +1,4 @@
-import { neon } from '@neondatabase/serverless';
+import { Pool } from 'pg';
 import { readFileSync } from 'fs';
 import { join, dirname } from 'path';
 import { fileURLToPath } from 'url';
@@ -14,7 +14,12 @@ async function runMigrations() {
     process.exit(1);
   }
 
-  const sql = neon(DATABASE_URL);
+  const pool = new Pool({
+    connectionString: DATABASE_URL,
+    ssl: {
+      rejectUnauthorized: false // Required for Railway
+    }
+  });
 
   console.log('🔄 Starting database migrations...\n');
 
@@ -33,12 +38,12 @@ async function runMigrations() {
     const migration2 = readFileSync(join(migrationsDir, '0001_light_psylocke.sql'), 'utf-8');
 
     // Check which tables already exist
-    const checkTables = await sql`
+    const checkTablesResult = await pool.query(`
       SELECT table_name FROM information_schema.tables 
       WHERE table_schema = 'public' 
       AND table_name IN ('users', 'chat_messages', 'events', 'tasks', 'conversation_contexts', 'meeting_drafts')
-    `;
-    const existingTables = checkTables.map((row: any) => row.table_name);
+    `);
+    const existingTables = checkTablesResult.rows.map((row: any) => row.table_name);
     
     console.log('📊 Existing tables:', existingTables.join(', ') || 'none\n');
 
@@ -49,7 +54,7 @@ async function runMigrations() {
       for (let i = 0; i < statements1.length; i++) {
         console.log(`  Executing statement ${i + 1}/${statements1.length}...`);
         try {
-          await sql(statements1[i]);
+          await pool.query(statements1[i]);
         } catch (err: any) {
           // Skip "already exists" errors
           if (err.code === '42P07') {
@@ -71,7 +76,7 @@ async function runMigrations() {
       for (let i = 0; i < statements2.length; i++) {
         console.log(`  Executing statement ${i + 1}/${statements2.length}...`);
         try {
-          await sql(statements2[i]);
+          await pool.query(statements2[i]);
         } catch (err: any) {
           // Skip "already exists" errors and column already exists
           if (err.code === '42P07' || err.code === '42701') {
@@ -95,8 +100,10 @@ async function runMigrations() {
     console.log('  - conversation_contexts ✅');
     console.log('  - meeting_drafts\n');
 
+    await pool.end();
   } catch (error) {
     console.error('❌ Migration failed:', error);
+    await pool.end();
     process.exit(1);
   }
 }
