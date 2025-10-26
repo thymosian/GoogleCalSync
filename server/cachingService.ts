@@ -119,6 +119,33 @@ export class CachingService {
 
     return `agenda_${Math.abs(hash)}`;
   }
+
+  /**
+   * Clear all agenda-related cache entries
+   */
+  clearAgendaCache(): number {
+    let clearedCount = 0;
+    const keysToDelete: string[] = [];
+
+    // Find all agenda cache keys
+    for (const [key] of this.cache.entries()) {
+      if (key.startsWith('agenda_')) {
+        keysToDelete.push(key);
+      }
+    }
+
+    // Delete the keys
+    for (const key of keysToDelete) {
+      this.cache.delete(key);
+      clearedCount++;
+    }
+
+    if (clearedCount > 0) {
+      console.log(`Cleared ${clearedCount} agenda cache entries`);
+    }
+
+    return clearedCount;
+  }
 }
 
 // Export singleton instance

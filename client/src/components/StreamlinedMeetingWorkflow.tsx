@@ -370,6 +370,27 @@ export function StreamlinedMeetingWorkflow({ onComplete, onSidebarUpdate }: Stre
 
        // Show success message
        addChatMessage('assistant', '🎉 Meeting agenda sent to all attendees successfully!');
+
+       // Trigger transcript generation after email is sent
+       try {
+         console.log('Triggering transcript generation after agenda email...');
+         const transcriptResponse = await apiRequest('POST', '/api/transcript/generate', {
+           meetingId: meetingData.id,
+           meetingData: meetingData
+         });
+         const transcriptData = await transcriptResponse.json();
+         console.log('Transcript generation triggered successfully');
+
+         // Show browser notification
+         if (transcriptData.success) {
+           alert(`Transcript is ready! Check your local transcripts folder: ${transcriptData.files?.transcript}`);
+           console.log(`📋 Transcript ready for meeting ${meetingData.id}. Check transcripts folder: ${transcriptData.files?.transcript}`);
+         }
+       } catch (transcriptError) {
+         console.error('Error triggering transcript generation:', transcriptError);
+         // Don't fail the workflow for transcript errors
+       }
+
        setCurrentStep('completed');
        setShowAgendaReview(false);
 

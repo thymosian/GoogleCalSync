@@ -1,6 +1,8 @@
 import type { Express, Request, Response } from "express";
 import { createServer, type Server } from "http";
 import passport from "passport";
+import * as fs from 'fs';
+import * as path from 'path';
 import { storage } from "./storage";
 import { fetchUpcomingEvents, deleteCalendarEvent, createCalendarEvent } from "./googleCalendar";
 import { getGeminiResponse, extractMeetingIntent, generateMeetingTitles, enhancePurposeWording, verifyAttendees, generateMeetingAgenda, generateActionItems, type MistralMessage, getContextualResponse } from "./aiInterface.js";
@@ -25,105 +27,7 @@ import errorReportingRoutes from "./routes/errorReportingRoutes";
 
 
 
-// Helper functions for fallback processing when AI fails
-function generateFallbackTitle(purpose: string): string {
-  if (!purpose || purpose.trim().length === 0) {
-    return "Team Meeting";
-  }
-
-  // Extract meaningful words (nouns, verbs) from the purpose
-  const words = purpose.toLowerCase()
-    .replace(/[^\w\s]/g, '') // Remove punctuation
-    .split(/\s+/)
-    .filter(word => word.length > 3); // Filter out short words
-
-  if (words.length === 0) {
-    return "Team Meeting";
-  }
-
-  // Look for action verbs
-  const actionVerbs = ['discuss', 'review', 'plan', 'analyze', 'create', 'design', 'build', 'develop', 'address', 'resolve', 'implement', 'update', 'organize', 'coordinate', 'schedule'];
-  const action = words.find(word => actionVerbs.includes(word));
-
-  // Get 2-3 key topic words
-  const topicWords = words
-    .filter(w => !actionVerbs.includes(w))
-    .slice(0, 2);
-
-  if (action && topicWords.length > 0) {
-    // Format: "Action Topic Words"
-    const title = [action.charAt(0).toUpperCase() + action.slice(1), ...topicWords.map(w => w.charAt(0).toUpperCase() + w.slice(1))].join(' ');
-    return title.substring(0, 50); // Limit to 50 chars
-  }
-
-  // Fallback: Use first few meaningful words
-  if (topicWords.length > 0) {
-    const title = topicWords.map(w => w.charAt(0).toUpperCase() + w.slice(1)).join(' ');
-    return title.substring(0, 50);
-  }
-
-  return "Team Meeting";
-}
-
-function generateFallbackPurpose(purpose: string): string {
-  // Create a more professional and structured version of the original purpose
-  if (!purpose || purpose.trim().length === 0) {
-    return "Team meeting to discuss important matters.";
-  }
-
-  const sentences = purpose.split(/[.!?]+/).filter(s => s.trim().length > 0);
-
-  if (sentences.length === 0) {
-    return purpose + '.';
-  }
-
-  // Enhance the first sentence and add structure
-  const mainPurpose = sentences[0].trim();
-  let enhanced = mainPurpose.charAt(0).toUpperCase() + mainPurpose.slice(1);
-
-  // Add additional context if there are multiple sentences
-  if (sentences.length > 1) {
-    enhanced += '. ' + sentences.slice(1, 3).join('. ').trim(); // Limit to 3 sentences total
-  }
-
-  // Ensure it ends with proper punctuation
-  if (!enhanced.match(/[.!?]$/)) {
-    enhanced += '.';
-  }
-
-  return enhanced;
-}
-
-function extractFallbackKeyPoints(purpose: string): string[] {
-  if (!purpose || purpose.trim().length === 0) {
-    return ["Discuss agenda", "Review progress", "Plan next steps"];
-  }
-
-  // Split into sentences
-  const sentences = purpose.split(/[.!?]+/)
-    .map(s => s.trim())
-    .filter(s => s.length > 10);
-
-  if (sentences.length === 0) {
-    // Extract key phrases from the purpose text
-    const words = purpose.split(/[\s,;]+/).filter(w => w.length > 3);
-    if (words.length > 0) {
-      return [
-        words.slice(0, 2).join(' '),
-        words.slice(2, 4).join(' ') || "Review details",
-        words.slice(4, 6).join(' ') || "Plan outcomes"
-      ];
-    }
-    return ["Discuss agenda", "Review progress", "Plan next steps"];
-  }
-
-  if (sentences.length <= 3) {
-    return sentences;
-  }
-
-  // Extract the most meaningful sentences as key points
-  return sentences.slice(0, 3);
-}
+// Removed hardcoded fallback functions - now using Mistral as fallback
 
 // Helper functions for UI block rendering
 function getUIBlockPriority(blockType: string): 'high' | 'medium' | 'low' {
@@ -328,64 +232,156 @@ export async function registerRoutes(app: Express): Promise<Server> {
     }
 
     try {
+      console.log(`🔍 Fetching tasks for user: ${(req.user as any).id}`);
       const user = req.user as any;
+      let dbTasksAvailable = true;
+      let formattedTasks: any[] = [];
+      let userEvents: any[] = [];
 
       // Import database and schema
       const { db } = await import('./storage.js');
       const { tasks, events } = await import('../shared/schema.js');
       const { eq } = await import('drizzle-orm');
+      const { taskFileStorage } = await import('./utils/taskFileStorage.js');
 
-      // Get all events for the current user
-      const userEvents = await db
-        .select()
-        .from(events)
-        .where(eq(events.userId, user.id));
+      try {
+        // Try to get tasks from database
+        console.log(`🔍 Querying database for user events...`);
+        userEvents = await db
+          .select()
+          .from(events)
+          .where(eq(events.userId, user.id));
 
-      if (userEvents.length === 0) {
-        return res.json({ tasks: [] });
+        if (userEvents.length > 0) {
+          console.log(`📅 Found ${userEvents.length} events for user`);
+          
+          // Get all tasks for user's events
+          const eventIds = userEvents.map(event => event.id);
+          console.log(`🔍 Querying database for tasks from ${eventIds.length} events...`);
+          
+          const eventTasks = await db
+            .select({
+              id: tasks.id,
+              eventId: tasks.eventId,
+              title: tasks.title,
+              description: tasks.description,
+              assignee: tasks.assignee,
+              deadline: tasks.deadline,
+              status: tasks.status,
+              createdAt: tasks.createdAt,
+              eventTitle: events.title,
+              eventStartTime: events.startTime
+            })
+            .from(tasks)
+            .innerJoin(events, eq(tasks.eventId, events.id))
+            .where(eq(events.userId, user.id));
+
+          console.log(`📋 Found ${eventTasks.length} tasks in database`);
+
+          // Convert to frontend format
+          formattedTasks = eventTasks.map(task => ({
+            id: task.id,
+            title: task.title,
+            description: task.description,
+            assignee: task.assignee,
+            deadline: task.deadline,
+            status: task.status as 'pending' | 'in_progress' | 'completed',
+            eventTitle: task.eventTitle,
+            eventId: task.eventId,
+            priority: 'medium' as const,
+            category: 'general',
+            source: 'database'
+          }));
+        } else {
+          console.log(`ℹ️ No events found for user in database`);
+        }
+      } catch (dbError) {
+        console.error('❌ Database error fetching tasks:', dbError);
+        dbTasksAvailable = false;
       }
 
-      // Get all tasks for user's events
-      const eventIds = userEvents.map(event => event.id);
-      const eventTasks = await db
-        .select({
-          id: tasks.id,
-          eventId: tasks.eventId,
-          title: tasks.title,
-          description: tasks.description,
-          assignee: tasks.assignee,
-          deadline: tasks.deadline,
-          status: tasks.status,
-          createdAt: tasks.createdAt,
-          eventTitle: events.title,
-          eventStartTime: events.startTime
-        })
-        .from(tasks)
-        .innerJoin(events, eq(tasks.eventId, events.id))
-        .where(eq(events.userId, user.id));
+      // Always check for file-based tasks for the user's events
+      console.log(`🔍 Checking for file-based tasks...`);
+      let fileBasedTasks: any[] = [];
+      
+      // For each event, check if there are file-based tasks
+      for (const event of userEvents) {
+        const meetingId = event.id;
+        const tasks = await taskFileStorage.getTasks(meetingId);
+        
+        if (tasks && tasks.length > 0) {
+          console.log(`📋 Found ${tasks.length} file-based tasks for meeting: ${meetingId}`);
+          
+          // Add these tasks to our collection
+          tasks.forEach(task => {
+            fileBasedTasks.push({
+              id: task.id,
+              title: task.title,
+              description: task.description,
+              assignee: task.assignee || 'Unassigned',
+              deadline: task.dueDate,
+              status: task.status,
+              eventTitle: event.title,
+              eventId: meetingId,
+              priority: task.priority,
+              category: task.category,
+              source: 'file'
+            });
+          });
+        }
+      }
+      
+      // If we have file-based tasks but no database tasks, use the file-based tasks
+      if (fileBasedTasks.length > 0 && (!dbTasksAvailable || formattedTasks.length === 0)) {
+        console.log(`ℹ️ Using ${fileBasedTasks.length} file-based tasks as primary source`);
+        formattedTasks = fileBasedTasks;
+      }
+      // If we have both, we could merge them or prioritize database tasks
+      else if (fileBasedTasks.length > 0) {
+        console.log(`ℹ️ Found both database and file-based tasks, using database as primary source`);
+        // Could add logic here to merge tasks if needed
+      }
 
-      // Convert to frontend format
-      const formattedTasks = eventTasks.map(task => ({
-        id: task.id,
-        title: task.title,
-        description: task.description,
-        assignee: task.assignee,
-        deadline: task.deadline,
-        status: task.status as 'pending' | 'in_progress' | 'completed',
-        eventTitle: task.eventTitle,
-        eventId: task.eventId,
-        priority: 'medium' as const, // Default priority
-        category: 'general'
-      }));
-
+      console.log(`✅ Returning ${formattedTasks.length} tasks to client`);
       res.json({
         tasks: formattedTasks,
         totalCount: formattedTasks.length,
-        meetingCount: userEvents.length
+        meetingCount: userEvents.length,
+        dbAvailable: dbTasksAvailable
       });
     } catch (error: any) {
-      console.error('Error fetching tasks:', error);
+      console.error('❌ Error fetching tasks:', error);
       res.status(500).json({ error: error.message || 'Failed to fetch tasks' });
+    }
+  });
+
+  // Add a New API Endpoint for Viewing Task Text Files
+  app.get('/api/tasks/file/:meetingId', async (req: Request, res: Response) => {
+    if (!req.isAuthenticated()) {
+      return res.status(401).json({ error: 'Not authenticated' });
+    }
+
+    try {
+      const meetingId = req.params.meetingId;
+      console.log(`🔍 Request to view task file for meeting: ${meetingId}`);
+      
+      // Check if the text file exists
+      const textFilePath = path.join(process.cwd(), 'tasks', `tasks-${meetingId}.txt`);
+      if (!fs.existsSync(textFilePath)) {
+        console.log(`⚠️ Task text file not found for meeting: ${meetingId}`);
+        return res.status(404).json({ error: 'Task text file not found' });
+      }
+      
+      console.log(`📖 Reading task text file: ${textFilePath}`);
+      const fileContent = fs.readFileSync(textFilePath, 'utf8');
+      
+      // Return the file content
+      console.log(`✅ Returning task text file content for meeting: ${meetingId}`);
+      res.setHeader('Content-Type', 'text/plain');
+      res.send(fileContent);
+    } catch (error: any) {
+      console.error(`❌ Error fetching task file for meeting ${req.params.meetingId}:`, error);
+      res.status(500).json({ error: error.message || 'Failed to fetch task file' });
     }
   });
 
@@ -617,26 +613,39 @@ export async function registerRoutes(app: Express): Promise<Server> {
     } catch (error: any) {
       console.error('Mistral AI error, attempting fallback:', error);
 
-      try {
-        const { purpose, participants, context } = req.body;
-        
-        // Fallback: Generate with basic processing
-        const fallbackTitle = generateFallbackTitle(purpose);
-        const fallbackPurpose = generateFallbackPurpose(purpose);
+      const { purpose, participants, context } = req.body;
 
-        console.log('Using fallback processing');
+      try {
+        // Use AI router with Mistral fallback for title generation
+        const { generateMeetingTitles } = await import('./aiInterface.js');
+        const titleSuggestion = await generateMeetingTitles(purpose, participants || [], context || '');
+
+        // Use AI router with Mistral fallback for purpose enhancement
+        const { enhancePurposeWording } = await import('./aiInterface.js');
+        const purposeEnhancement = await enhancePurposeWording(purpose, titleSuggestion.suggestions[0], participants || [], context || '');
+
+        console.log('Using AI router with Mistral fallback processing');
 
         res.json({
-          title: fallbackTitle,
-          titleSuggestions: [fallbackTitle, `${fallbackTitle} Discussion`, `${fallbackTitle} Planning`],
-          enhancedPurpose: fallbackPurpose,
-          keyPoints: extractFallbackKeyPoints(purpose),
-          fallback: true,
+          title: titleSuggestion.suggestions[0],
+          titleSuggestions: titleSuggestion.suggestions,
+          enhancedPurpose: purposeEnhancement.enhancedPurpose,
+          keyPoints: purposeEnhancement.keyPoints,
+          fallback: 'mistral',
           error: error.message
         });
       } catch (fallbackError: any) {
-        console.error('Both Mistral and fallback failed:', fallbackError);
-        res.status(500).json({ error: error.message || 'Failed to generate meeting titles and purpose' });
+        console.error('AI router fallback also failed:', fallbackError);
+        // Emergency hardcoded fallback if everything fails
+        const emergencyTitle = purpose ? `${purpose.substring(0, 30)} Meeting` : "Team Meeting";
+        res.json({
+          title: emergencyTitle,
+          titleSuggestions: [emergencyTitle, "Discussion Session", "Project Sync"],
+          enhancedPurpose: purpose || "Team meeting to discuss important matters.",
+          keyPoints: ["Discuss main topics", "Review progress", "Plan next steps"],
+          fallback: 'emergency',
+          error: fallbackError.message
+        });
       }
     }
   });
@@ -693,26 +702,39 @@ export async function registerRoutes(app: Express): Promise<Server> {
         context: titleSuggestion.context
       });
     } catch (error: any) {
-      console.error('Mistral AI error, attempting fallback:', error);
+      console.error('AI router failed for generateMeetingTitles, using direct Mistral fallback:', error);
 
       try {
-        // Fallback: Generate with basic processing
-        const fallbackTitle = generateFallbackTitle(purpose);
-        const fallbackPurpose = generateFallbackPurpose(purpose);
+        // Direct Mistral fallback for title generation
+        const { generateMeetingTitles: mistralTitles } = await import('./mistralService.js');
+        const titleSuggestion = await mistralTitles(purpose, participants || [], context || '');
 
-        console.log('Using fallback processing:', fallbackTitle);
+        // Direct Mistral fallback for purpose enhancement
+        const { enhancePurposeWording: mistralEnhance } = await import('./mistralService.js');
+        const purposeEnhancement = await mistralEnhance(purpose, titleSuggestion.suggestions[0], participants || [], context || '');
+
+        console.log('Using direct Mistral fallback processing');
 
         res.json({
-          title: fallbackTitle,
-          titleSuggestions: [fallbackTitle, `${fallbackTitle} Discussion`, `${fallbackTitle} Review`],
-          enhancedPurpose: fallbackPurpose,
-          keyPoints: extractFallbackKeyPoints(purpose),
-          fallback: 'hardcoded',
+          title: titleSuggestion.suggestions[0],
+          titleSuggestions: titleSuggestion.suggestions,
+          enhancedPurpose: purposeEnhancement.enhancedPurpose,
+          keyPoints: purposeEnhancement.keyPoints,
+          fallback: 'mistral',
           error: error.message
         });
       } catch (fallbackError: any) {
-        console.error('Both Mistral and fallback failed:', fallbackError);
-        res.status(500).json({ error: error.message || 'Failed to generate meeting titles and purpose' });
+        console.error('Direct Mistral fallback also failed:', fallbackError);
+        // Emergency hardcoded fallback if everything fails
+        const emergencyTitle = purpose ? `${purpose.substring(0, 30)} Meeting` : "Team Meeting";
+        res.json({
+          title: emergencyTitle,
+          titleSuggestions: [emergencyTitle, "Discussion Session", "Project Sync"],
+          enhancedPurpose: purpose || "Team meeting to discuss important matters.",
+          keyPoints: ["Discuss main topics", "Review progress", "Plan next steps"],
+          fallback: 'emergency',
+          error: fallbackError.message
+        });
       }
     }
   });
@@ -2523,6 +2545,185 @@ export async function registerRoutes(app: Express): Promise<Server> {
     }
   );
 
+  // Transcript generation endpoint
+  app.post('/api/transcript/generate', async (req: Request, res: Response) => {
+    if (!req.isAuthenticated()) {
+      return res.status(401).json({ error: 'Not authenticated' });
+    }
+
+    try {
+      const { meetingId, meetingData } = req.body;
+
+      if (!meetingId || !meetingData) {
+        return res.status(400).json({ error: 'Meeting ID and meeting data are required' });
+      }
+
+      const user = req.user as any;
+
+      // Import transcript service
+      const { transcriptService } = await import('./transcriptService.js');
+
+      // Generate transcript
+      const transcript = await transcriptService.generateMeetingTranscript(
+        meetingId,
+        meetingData.title || 'Meeting',
+        meetingData.enhancedPurpose || meetingData.purpose || 'Meeting discussion',
+        meetingData.attendees?.map((a: any) => a.email) || [],
+        meetingData.startTime && meetingData.endTime ?
+          Math.round((new Date(meetingData.endTime).getTime() - new Date(meetingData.startTime).getTime()) / (1000 * 60)) :
+          60,
+        new Date(meetingData.startTime || Date.now()),
+        meetingData.meetingLink
+      );
+
+      // Generate summary
+      const summary = await transcriptService.generateMeetingSummary(transcript);
+
+      // Extract tasks
+      const tasks = await transcriptService.extractTasksFromSummary(summary);
+
+      // Store tasks in database
+      const { db } = await import('./storage.js');
+      const { tasks: taskTable } = await import('../shared/schema.js');
+
+      for (const task of tasks) {
+        await db.insert(taskTable).values({
+          eventId: meetingId,
+          title: task.title,
+          description: task.description,
+          assignee: task.assignee || 'Unassigned',
+          deadline: task.dueDate,
+          status: task.status,
+          createdAt: new Date()
+        } as any);
+      }
+
+      // Send summary to attendees
+      if (meetingData.attendees && meetingData.attendees.length > 0) {
+        const { emailWorkflowOrchestrator } = await import('./emailWorkflowOrchestrator.js');
+
+        const summaryContent = `
+# Meeting Summary: ${summary.title}
+
+## Overview
+${summary.summary}
+
+## Key Points
+${summary.keyPoints.map(point => `• ${point}`).join('\n')}
+
+## Decisions Made
+${summary.decisions.map(decision => `• ${decision}`).join('\n')}
+
+## Action Items
+${summary.actionItems.map(item => `• ${item}`).join('\n')}
+
+---
+Generated by AI Assistant
+        `.trim();
+
+        await emailWorkflowOrchestrator.startEmailSendingWorkflow(
+          user,
+          meetingId,
+          meetingData.attendees.map((attendee: any) => ({
+            email: attendee.email,
+            isValid: true,
+            exists: true,
+            isGoogleUser: true
+          })),
+          {
+            title: summary.title,
+            startTime: meetingData.startTime,
+            endTime: meetingData.endTime,
+            type: meetingData.type
+          },
+          {
+            title: summary.title,
+            duration: 60,
+            topics: [
+              {
+                title: 'Meeting Summary Review',
+                duration: 10,
+                description: 'Review the meeting summary and key outcomes'
+              }
+            ],
+            actionItems: summary.actionItems.map(item => ({
+              task: item,
+              priority: 'medium' as const
+            })),
+            enhancedPurpose: summaryContent
+          }
+        );
+      }
+
+      // Generate magic links for attendees
+      const magicLinks = new Map<string, string>();
+      for (const attendee of meetingData.attendees || []) {
+        const token = `magic_${Date.now()}_${Math.random().toString(36).substr(2, 16)}`;
+        const magicLink = `${process.env.FRONTEND_URL || 'http://localhost:3000'}/tasks/${meetingId}?token=${token}&email=${encodeURIComponent(attendee.email)}`;
+        magicLinks.set(attendee.email, magicLink);
+      }
+
+      // Send magic link emails
+      const { gmailService } = await import('./gmailService.js');
+      for (const attendee of meetingData.attendees || []) {
+        const magicLink = magicLinks.get(attendee.email);
+        if (magicLink) {
+          const emailContent = `
+Hello ${attendee.firstName || attendee.email},
+
+Your meeting "${meetingData.title}" has concluded and tasks have been generated.
+
+Click the link below to view and complete your assigned tasks:
+${magicLink}
+
+This link will allow you to:
+• View all tasks from the meeting
+• Mark your tasks as complete
+• See progress on team tasks
+
+---
+This is an automated message from your AI Calendar Assistant.
+          `.trim();
+
+          console.log(`📧 Magic link email would be sent to ${attendee.email}: ${magicLink}`);
+        }
+      }
+
+      console.log(`✅ Transcript workflow completed for meeting: ${meetingId}`);
+
+      res.json({
+        success: true,
+        message: 'Transcript generated and stored successfully',
+        transcript: {
+          meetingId: transcript.meetingId,
+          title: transcript.title,
+          wordCount: transcript.wordCount,
+          generatedAt: transcript.generatedAt,
+          filePath: transcript.filePath
+        },
+        summary: {
+          meetingId: summary.meetingId,
+          keyPointsCount: summary.keyPoints.length,
+          decisionsCount: summary.decisions.length,
+          actionItemsCount: summary.actionItems.length,
+          filePath: summary.filePath
+        },
+        tasksCount: tasks.length,
+        files: {
+          transcript: transcript.filePath,
+          summary: summary.filePath
+        }
+      });
+
+      // Log transcript ready
+      console.log(`📋 Transcript ready for meeting ${meetingId}. Check transcripts folder: ${transcript.filePath}`);
+
+    } catch (error: any) {
+      console.error('Error generating transcript:', error);
+      res.status(500).json({ error: error.message || 'Failed to generate transcript' });
+    }
+  });
+
   // Email workflow endpoints
   app.post('/api/email/send-agenda', async (req: Request, res: Response) => {
     if (!req.isAuthenticated()) {
@@ -2891,7 +3092,7 @@ export async function registerRoutes(app: Express): Promise<Server> {
     }
   });
 
-  // Helper function to validate AI response completeness - more strict for completeness
+  // Helper function to validate AI response completeness - more lenient for better AI adoption
   function validateAgendaResponse(response: string, title: string, enhancedPurpose: string): boolean {
     console.log('🔍 Validating agenda response:', {
       length: response.length,
@@ -2900,13 +3101,13 @@ export async function registerRoutes(app: Express): Promise<Server> {
       hasH3: response.includes('<h3>'),
       hasContent: response.includes('<p>') || response.includes('<ul>') || response.includes('<li>'),
       sectionCount: (response.match(/<h3>/g) || []).length,
-      hasIntroduction: response.toLowerCase().includes('introduction'),
-      hasDiscussion: response.toLowerCase().includes('discussion'),
-      hasAction: response.toLowerCase().includes('action')
+      hasIntroduction: response.toLowerCase().includes('introduction') || response.toLowerCase().includes('welcome') || response.toLowerCase().includes('opening'),
+      hasDiscussion: response.toLowerCase().includes('discussion') || response.toLowerCase().includes('review') || response.toLowerCase().includes('topics'),
+      hasAction: response.toLowerCase().includes('action') || response.toLowerCase().includes('next') || response.toLowerCase().includes('steps')
     });
 
-    // Basic requirements - if these fail, reject
-    if (!response || response.length < 400) {
+    // Basic requirements - more lenient
+    if (!response || response.length < 200) { // Reduced from 400 to 200
       console.warn('❌ Response too short:', response.length, 'characters');
       return false;
     }
@@ -2916,47 +3117,53 @@ export async function registerRoutes(app: Express): Promise<Server> {
       return false;
     }
 
-    if (!response.includes(title.substring(0, 20))) {
-      console.warn('❌ Response missing meeting title');
+    // More lenient title check - just check if it contains some words from the title
+    const titleWords = title.split(' ').slice(0, 2).join(' ').toLowerCase();
+    if (!response.toLowerCase().includes(titleWords)) {
+      console.warn('❌ Response missing meeting title reference');
       return false;
     }
 
-    // Require at least 3 sections
+    // Require at least 2 sections instead of 3
     const sectionCount = (response.match(/<h3>/g) || []).length;
-    if (sectionCount < 3) {
+    if (sectionCount < 2) { // Reduced from 3 to 2
       console.warn('❌ Response missing required sections:', sectionCount, 'found');
       return false;
     }
 
-    // Check for key sections
-    const hasIntroduction = response.toLowerCase().includes('introduction');
-    const hasDiscussion = response.toLowerCase().includes('discussion');
-    const hasAction = response.toLowerCase().includes('action');
-    if (!hasIntroduction || !hasDiscussion || !hasAction) {
-      console.warn('❌ Response missing key sections: intro, discussion, action');
+    // Check for key sections - more flexible keywords
+    const hasIntroduction = response.toLowerCase().includes('introduction') || response.toLowerCase().includes('welcome') || response.toLowerCase().includes('opening');
+    const hasDiscussion = response.toLowerCase().includes('discussion') || response.toLowerCase().includes('review') || response.toLowerCase().includes('topics');
+    const hasAction = response.toLowerCase().includes('action') || response.toLowerCase().includes('next') || response.toLowerCase().includes('steps');
+
+    // Only require 2 out of 3 sections instead of all 3
+    const sectionScore = [hasIntroduction, hasDiscussion, hasAction].filter(Boolean).length;
+    if (sectionScore < 2) {
+      console.warn('❌ Response missing sufficient key sections:', { hasIntroduction, hasDiscussion, hasAction, sectionScore });
       return false;
     }
 
-    // Check for obviously truncated content
-    if (response.endsWith('<') || response.endsWith('&') || response.endsWith('<b>') || response.endsWith('<s') || response.endsWith('<')) {
+    // Check for obviously truncated content - more lenient
+    if (response.endsWith('<') || response.endsWith('&') || response.endsWith('<b>') || response.endsWith('<s')) {
       console.warn('❌ Response appears to be truncated');
       return false;
     }
 
-    // Check for severely mismatched HTML tags
+    // Check for severely mismatched HTML tags - more lenient
     const openTags = (response.match(/<\w+/g) || []).length;
     const closeTags = (response.match(/<\/\w+/g) || []).length;
     const tagDifference = Math.abs(openTags - closeTags);
 
-    if (tagDifference > 10) { // Stricter tolerance
+    if (tagDifference > 15) { // Increased tolerance from 10 to 15
       console.warn('❌ Response has mismatched HTML tags:', { openTags, closeTags, difference: tagDifference });
       return false;
     }
 
     // If we get here, the response is good
-    console.log('✅ Agenda response accepted (strict validation):', {
+    console.log('✅ Agenda response accepted (lenient validation):', {
       length: response.length,
       sections: sectionCount,
+      sectionScore,
       hasAllSections: hasIntroduction && hasDiscussion && hasAction
     });
 
@@ -3028,18 +3235,25 @@ export async function registerRoutes(app: Express): Promise<Server> {
     const decisionTime = Math.ceil((duration || 60) * 0.15);
     const actionTime = Math.ceil((duration || 60) * 0.15);
 
+    // Extract key topics from the enhanced purpose for more personalized fallback
+    const purposeWords = enhancedPurpose.toLowerCase().split(' ');
+    const keyTopics = purposeWords.filter(word =>
+      word.length > 4 &&
+      !['this', 'that', 'with', 'from', 'they', 'will', 'have', 'been', 'were', 'would', 'could', 'should'].includes(word)
+    ).slice(0, 3);
+
     return `
       <h2>Meeting Agenda: ${title}</h2>
       <p><strong>Duration:</strong> ${duration || 60} minutes</p>
 
-      <h3>1. Professional Introduction (${introTime} minutes)</h3>
+      <h3>Introduction (${introTime} minutes)</h3>
       <ul>
         <li>Welcome and context setting</li>
         <li>Meeting objectives overview</li>
         <li>Participant roles and expectations</li>
       </ul>
 
-      <h3>2. Core Discussion Topics (${discussionTime} minutes)</h3>
+      <h3>Main Discussion (${discussionTime} minutes)</h3>
       <ul>
         <li><strong>Topic Analysis:</strong> Review key objectives and challenges from the meeting purpose</li>
         <li><strong>Problem Identification:</strong> Address specific issues mentioned in the enhanced purpose</li>
@@ -3047,7 +3261,7 @@ export async function registerRoutes(app: Express): Promise<Server> {
         <li><strong>Decision Making:</strong> Build consensus on next steps and action plans</li>
       </ul>
 
-      <h3>3. Decision Points & Problem Solving (${decisionTime} minutes)</h3>
+      <h3>Decision Making (${decisionTime} minutes)</h3>
       <ul>
         <li>Identify specific decisions that need to be made based on the meeting purpose</li>
         <li>Address any problems or challenges mentioned</li>
@@ -3055,7 +3269,7 @@ export async function registerRoutes(app: Express): Promise<Server> {
         <li>Build consensus on implementation plans</li>
       </ul>
 
-      <h3>4. Action Items & Accountability (${actionTime} minutes)</h3>
+      <h3>Action Items (${actionTime} minutes)</h3>
       <ul>
         <li>Specific deliverables and outcomes expected from this meeting</li>
         <li>Responsible parties for follow-up actions</li>
@@ -3063,7 +3277,7 @@ export async function registerRoutes(app: Express): Promise<Server> {
         <li>Success metrics and KPIs relevant to the meeting purpose</li>
       </ul>
 
-      <h3>5. Meeting Link and Logistics</h3>
+      <h3>Logistics</h3>
       <ul>
         <li><strong>Meeting Link:</strong> ${meetingLink ? `<a href="${meetingLink}">${meetingLink}</a>` : 'TBD'}</li>
         <li>Technical requirements and preparation needed</li>
@@ -3071,55 +3285,11 @@ export async function registerRoutes(app: Express): Promise<Server> {
         <li>Any pre-reading or preparation required</li>
       </ul>
 
-      <h3>6. Professional Closing (${Math.ceil((duration || 60) * 0.1)} minutes)</h3>
-      <ul>
-        <li>Summary of key decisions and action items</li>
-        <li>Next steps and follow-up timeline</li>
-        <li>Thank you and Q&A</li>
-      </ul>
-
       <p><em>Please come prepared with relevant data and be ready to contribute to the discussion.</em></p>
     `;
   }
 
-  // Helper function to generate simple narrative content when AI is unavailable
-  function generateSimpleNarrativeContent(title: string, enhancedPurpose: string, duration: number = 60, meetingLink?: string, participants?: string[]): string {
-    const participantCount = participants?.length || 0;
-
-    return `Meeting: ${title}
-
-Purpose: ${enhancedPurpose}
-
-Duration: ${duration} minutes
-Participants: ${participantCount} attendees
-
-This meeting brings together key team members to address important aspects of our current projects and processes. Participants will discuss challenges, share insights, and develop actionable solutions.
-
-Expected outcomes include:
-• Clear action items and responsibilities
-• Timeline for implementation
-• Next steps for follow-up
-
-${meetingLink ? `Join the meeting at: ${meetingLink}` : ''}
-
-All participants are encouraged to come prepared and contribute to the discussion.`;
-  }
-
-  // Helper function to generate fallback narrative content
-  function generateFallbackNarrativeContent(title: string, enhancedPurpose: string, duration?: number, meetingLink?: string, participants?: string[]): string {
-    const participantCount = participants?.length || 0;
-    const durationText = duration ? `${duration} minutes` : 'the scheduled time';
-
-    return `This meeting, titled "${title}", brings together ${participantCount} key participants to address critical aspects of ${enhancedPurpose.toLowerCase()}. The session is designed to last ${durationText} and represents an important opportunity for collaborative problem-solving and strategic alignment.
-
-The meeting focuses on identifying core challenges and opportunities within our current processes, with particular attention to how we can improve efficiency and outcomes. Participants will engage in detailed discussions about the specific issues at hand, drawing on their expertise and experience to develop actionable solutions.
-
-By bringing together diverse perspectives and areas of expertise, this meeting aims to foster innovative thinking and build consensus around the best path forward. The collaborative environment will encourage open dialogue and creative problem-solving, ensuring that all voices are heard and valuable insights are captured.
-
-Expected outcomes include clear action items, assigned responsibilities, and a shared understanding of next steps. The meeting will also establish mechanisms for tracking progress and maintaining accountability as we move forward with implementation.
-
-${meetingLink ? `Participants should use the provided meeting link (${meetingLink}) to join the session.` : 'Meeting access details will be provided separately.'} All participants are encouraged to come prepared with relevant data, examples, and ideas to contribute to the discussion.`;
-  }
+  // Removed hardcoded narrative fallback functions - now using Mistral as fallback
 
   // Enhanced agenda generation for Step 7 workflow
   app.post('/api/meetings/generate-rich-agenda', async (req: Request, res: Response) => {
@@ -3141,16 +3311,20 @@ ${meetingLink ? `Participants should use the provided meeting link (${meetingLin
       const meetingData = { id: meetingId, title, enhancedPurpose, attendees: participants, startTime, endTime };
       const cacheKey = cachingService.generateAgendaCacheKey(meetingData);
 
-      // Check cache first
+      // Check cache first - but only use cache if it's not a fallback
       const cachedAgenda = cachingService.get(cacheKey);
-      if (cachedAgenda) {
-        console.log('Returning cached agenda for meeting:', title);
+      if (cachedAgenda && cachedAgenda.isAIGenerated) {
+        console.log('Returning cached AI-generated agenda for meeting:', title);
         return res.json({
           success: true,
           agenda: cachedAgenda,
           cached: true,
           generatedAt: new Date().toISOString()
         });
+      } else if (cachedAgenda && !cachedAgenda.isAIGenerated) {
+        console.log('Cached agenda is fallback content, clearing cache and regenerating with AI');
+        // Clear the fallback cache entry
+        cachingService.delete(cacheKey);
       }
 
       // Generate detailed, comprehensive agenda using AI - optimized for ReactQuill compatibility
@@ -3162,27 +3336,35 @@ ${meetingLink ? `Participants should use the provided meeting link (${meetingLin
         Duration: ${duration || 60} minutes
         Attendees: ${participants?.length || 0}
 
-        Structure the agenda with these sections:
+        CRITICAL: You MUST structure the agenda with these EXACT sections:
         1. Introduction (10% of time) - Welcome, objectives, ground rules
         2. Main Discussion (60% of time) - 3-4 key topics with bullet points, connected to purpose
         3. Decision Making (15% of time) - Identify decisions, discuss solutions
         4. Action Items (10% of time) - Deliverables, responsibilities, deadlines
         5. Logistics (5% of time) - Meeting link: ${meetingLink || 'TBD'}, prep, Q&A
 
-        Requirements:
-        - Start with <h2>Meeting Agenda: ${title}</h2>
-        - Use <h3> for sections, <p> for text, <ul><li> for bullets
-        - Include time allocations in bold
+        MANDATORY REQUIREMENTS:
+        - Start EXACTLY with: <h2>Meeting Agenda: ${title}</h2>
+        - Use <h3> for ALL section headers (Introduction, Main Discussion, Decision Making, Action Items, Logistics)
+        - Use <p> for descriptive text and <ul><li> for bullet points
+        - Include time allocations in parentheses like "(10 minutes)"
         - Total time must equal ${duration || 60} minutes
-        - Make it detailed, professional, and directly related to the purpose
+        - Make it detailed, professional, and directly related to the purpose: "${enhancedPurpose}"
         - Generate the full agenda in one complete response
         - Aim for 500-700 words
+        - Include the words "introduction", "discussion", and "action" in your section headers or content
+
+        IMPORTANT: Your response will be validated strictly. Ensure it contains:
+        - The exact title in the h2 tag
+        - At least 3 h3 sections
+        - Proper HTML structure with matching opening and closing tags
+        - Content that relates to the meeting purpose
       `;
 
       const messages = [
         {
           role: 'system',
-          content: 'You are a professional meeting facilitator and agenda specialist. Create detailed, comprehensive agendas that ensure productive and well-structured meetings. You MUST return ONLY valid HTML FRAGMENT content with NO markdown, NO code blocks, NO backticks, NO ```html, NO <html>, <head>, or <body> tags. Start directly with <h2> and use proper HTML fragment tags throughout. Return pure HTML fragments only.'
+          content: 'You are a professional meeting facilitator and agenda specialist. Create detailed, comprehensive agendas that ensure productive and well-structured meetings. You MUST return ONLY valid HTML FRAGMENT content with NO markdown, NO code blocks, NO backticks, NO ```html, NO <html>, <head>, or <body> tags. Start directly with <h2> and use proper HTML fragment tags throughout. Return pure HTML fragments only. CRITICAL: Always include the words "introduction", "discussion", and "action" in your content. Use exactly 3-5 <h3> sections. Ensure all HTML tags are properly closed and balanced.'
         },
         {
           role: 'user',
@@ -3265,11 +3447,18 @@ ${meetingLink ? `Participants should use the provided meeting link (${meetingLin
         meetingLink,
         enhancedPurpose,
         wordCount: richAgendaText.split(' ').length,
-        estimatedReadingTime: Math.ceil(richAgendaText.split(' ').length / 200) // Assume 200 words per minute
+        estimatedReadingTime: Math.ceil(richAgendaText.split(' ').length / 200), // Assume 200 words per minute
+        isAIGenerated: !finalHtmlContent.includes('Professional Introduction') || finalHtmlContent.length > 1000, // Mark as AI if not fallback and substantial length
+        fallback: finalHtmlContent.includes('Professional Introduction') // Mark if it's fallback content
       };
 
-      // Cache the successful result
-      cachingService.set(cacheKey, agendaResult, 30 * 60 * 1000); // Cache for 30 minutes
+      // Cache the successful result - only cache AI-generated content, not fallbacks
+      if (agendaResult.isAIGenerated) {
+        cachingService.set(cacheKey, agendaResult, 30 * 60 * 1000); // Cache for 30 minutes
+        console.log('✅ Cached AI-generated agenda content');
+      } else {
+        console.log('⚠️ Not caching fallback content');
+      }
 
       res.json({
         success: true,
@@ -3387,7 +3576,7 @@ ${meetingLink ? `Participants should use the provided meeting link (${meetingLin
 
           console.error('❌ Narrative response failed validation after all retries, using fallback');
           const fallbackDuration = duration || 60;
-          return generateFallbackNarrativeContent(title, enhancedPurpose, fallbackDuration, meetingLink, participants);
+          return `This meeting titled "${title}" focuses on ${enhancedPurpose.toLowerCase()}. It brings together key participants to discuss important matters and make decisions that will impact our work. The meeting is scheduled for ${fallbackDuration} minutes and represents an important opportunity for collaboration and alignment. Participants are encouraged to come prepared and contribute to the discussion.`;
 
         } catch (error: any) {
           console.error(`❌ Error in narrative generation attempt ${retryCount + 1}:`, error.message);
@@ -3402,7 +3591,7 @@ ${meetingLink ? `Participants should use the provided meeting link (${meetingLin
           // Use fallback for any error after all retries
           console.error('❌ Narrative generation failed completely, using fallback');
           const fallbackDuration = duration || 60;
-          return generateFallbackNarrativeContent(title, enhancedPurpose, fallbackDuration, meetingLink, participants);
+          return `This meeting titled "${title}" focuses on ${enhancedPurpose.toLowerCase()}. It brings together key participants to discuss important matters and make decisions that will impact our work. The meeting is scheduled for ${fallbackDuration} minutes and represents an important opportunity for collaboration and alignment. Participants are encouraged to come prepared and contribute to the discussion.`;
         }
       };
 
@@ -3417,7 +3606,7 @@ ${meetingLink ? `Participants should use the provided meeting link (${meetingLin
         if (narrativeDescription.length < 150) {
           console.warn('⚠️ Generated narrative too short, using fallback');
           const fallbackDuration = duration || 60;
-          narrativeDescription = generateFallbackNarrativeContent(title, enhancedPurpose, fallbackDuration, meetingLink, participants);
+          narrativeDescription = `This meeting titled "${title}" focuses on ${enhancedPurpose.toLowerCase()}. It brings together key participants to discuss important matters and make decisions that will impact our work. The meeting is scheduled for ${fallbackDuration} minutes and represents an important opportunity for collaboration and alignment. Participants are encouraged to come prepared and contribute to the discussion.`;
         }
 
         // Clean up any unwanted formatting
@@ -3436,19 +3625,43 @@ ${meetingLink ? `Participants should use the provided meeting link (${meetingLin
       } catch (error: any) {
         console.error('❌ Narrative generation failed completely:', error.message);
 
-        // Use appropriate fallback based on error type
-        if (error.message.includes('quota') || error.message.includes('rate limit') || error.message.includes('429')) {
-          console.warn('🤖 AI quota exceeded, using simple fallback narrative');
-          const fallbackDuration = duration || 60;
-          narrativeDescription = generateSimpleNarrativeContent(title, enhancedPurpose, fallbackDuration, meetingLink, participants);
-        } else if (error.message.includes('timeout') || error.message.includes('network')) {
-          console.warn('🌐 Network/AI timeout, using comprehensive fallback');
-          const fallbackDuration = duration || 60;
-          narrativeDescription = generateFallbackNarrativeContent(title, enhancedPurpose, fallbackDuration, meetingLink, participants);
-        } else {
-          console.warn('💥 Unexpected error, using comprehensive fallback');
-          const fallbackDuration = duration || 60;
-          narrativeDescription = generateFallbackNarrativeContent(title, enhancedPurpose, fallbackDuration, meetingLink, participants);
+        // Use AI router with Mistral fallback for narrative generation
+        console.warn('🤖 AI quota exceeded, using AI router with Mistral fallback for narrative');
+        try {
+          const { generateResponse } = await import('./aiInterface.js');
+
+          const narrativePrompt = `Write a professional narrative meeting description for:
+
+Title: "${title}"
+Purpose: "${enhancedPurpose}"
+Duration: ${duration || 60} minutes
+Attendees: ${participants?.length || 0}
+
+Write a cohesive narrative paragraph (200-400 words) that explains:
+- Why this meeting is necessary and important
+- What participants will accomplish together
+- How it connects to broader organizational goals
+- Expected outcomes and value for attendees
+
+Use professional, engaging language. Write in complete sentences and end with appropriate punctuation. Focus on the meeting's purpose and benefits.`;
+
+          const messages = [
+            {
+              role: 'system',
+              content: 'You are a professional business writer who specializes in creating clear, engaging, and informative meeting descriptions. Your writing is concise yet comprehensive, with a warm professional tone that motivates readers to participate actively in meetings.'
+            },
+            {
+              role: 'user',
+              content: narrativePrompt
+            }
+          ];
+
+          narrativeDescription = await generateResponse(messages);
+          console.log('✅ AI router with Mistral fallback narrative generated successfully');
+        } catch (routerError) {
+          console.error('AI router fallback also failed, using emergency fallback:', routerError);
+          // Emergency fallback if everything fails
+          narrativeDescription = `This meeting titled "${title}" focuses on ${enhancedPurpose.toLowerCase()}. It brings together key participants to discuss important matters and make decisions that will impact our work. The meeting is scheduled for ${duration || 60} minutes and represents an important opportunity for collaboration and alignment. Participants are encouraged to come prepared and contribute to the discussion.`;
         }
       }
 
@@ -3769,9 +3982,33 @@ ${meetingLink ? `Participants should use the provided meeting link (${meetingLin
     }
   });
 
+  // Cache management endpoint for agenda generation
+  app.post('/api/cache/clear-agenda', async (req: Request, res: Response) => {
+    if (!req.isAuthenticated()) {
+      return res.status(401).json({ error: 'Not authenticated' });
+    }
+
+    try {
+      const { cachingService } = await import('./cachingService.js');
+
+      // Clear all agenda-related cache entries
+      const clearedCount = cachingService.clearAgendaCache();
+
+      res.json({
+        success: true,
+        message: `Cleared ${clearedCount} agenda cache entries`,
+        clearedCount,
+        clearedAt: new Date().toISOString()
+      });
+    } catch (error: any) {
+      console.error('Error clearing agenda cache:', error);
+      res.status(500).json({ error: error.message || 'Failed to clear agenda cache' });
+    }
+  });
+
   // Performance monitoring routes
   app.use('/api/performance', performanceRoutes);
-  
+
   // Configuration health routes
   app.use('/api/config', configHealthRoutes);
 

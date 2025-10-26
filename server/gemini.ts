@@ -3,6 +3,7 @@ import { MeetingExtraction, TitleSuggestion, ConversationMessage, MeetingData } 
 import { MEETING_CREATION_PROMPTS, MEETING_CREATION_RULES } from './prompts.js';
 import { performanceMonitor } from './performanceMonitor.js';
 import { aiServiceErrorHandler } from './errorHandlers/aiServiceErrorHandler.js';
+import { retryWithExponentialBackoff, isRetryableError } from './utils/retryUtils.js';
 
 // Gemini configuration interface
 export interface GeminiConfig {
@@ -128,25 +129,13 @@ function getGeminiModel(config: Partial<GeminiConfig> = {}): GenerativeModel {
     throw new Error('Failed to initialize any Gemini model');
 }
 
-// Enhanced error handling with retry logic for overloaded models
-async function handleGeminiError(error: any, operation: string, retryCount: number = 0): Promise<Error> {
-    console.error(`Gemini API error during ${operation} (attempt ${retryCount + 1}):`, error);
+// Enhanced error handling for Gemini API errors
+async function handleGeminiError(error: any, operation: string): Promise<Error> {
+    console.error(`Gemini API error during ${operation}:`, error);
 
     // Log error details for monitoring
     if (error.status) {
         console.error(`Status: ${error.status}, Message: ${error.message}`);
-    }
-
-    // Handle 503 Service Unavailable (model overloaded) with retry
-    if (error.status === 503 && retryCount < 2) {
-        const delay = Math.pow(2, retryCount) * 1000; // Exponential backoff: 1s, 2s, 4s
-        console.log(`Model overloaded, retrying in ${delay}ms...`);
-
-        await new Promise(resolve => setTimeout(resolve, delay));
-
-        // Use existing AI service error handler for consistent error handling
-        const aiError = aiServiceErrorHandler.classifyError(error);
-        return new Error(`${aiError.message} (retry ${retryCount + 1}/3)`);
     }
 
     // Use existing AI service error handler for consistent error handling
@@ -290,76 +279,70 @@ export function filterAndConvertMessages(messages: MistralMessage[]): GeminiMess
 // Core response generation functions
 
 /**
- * Main Gemini response function with retry logic for overloaded models
+ * Main Gemini response function with enhanced retry logic using exponential backoff
  * Maintains the same interface for backward compatibility
  */
-export async function getGeminiResponse(messages: MistralMessage[], retryCount: number = 0): Promise<string> {
-    const startTime = Date.now();
-    const inputText = messages.map(m => m.content).join(' ');
-    const inputTokens = performanceMonitor.estimateTokenCount(inputText);
+export async function getGeminiResponse(messages: MistralMessage[]): Promise<string> {
+    return await retryWithExponentialBackoff(async () => {
+        const startTime = Date.now();
+        const inputText = messages.map(m => m.content).join(' ');
+        const inputTokens = performanceMonitor.estimateTokenCount(inputText);
 
-    try {
-        // Convert messages to Gemini format
-        const { geminiMessages, systemInstruction } = convertToGeminiFormat(messages);
+        try {
+            // Convert messages to Gemini format
+            const { geminiMessages, systemInstruction } = convertToGeminiFormat(messages);
 
-        // Get model with custom system instruction if provided
-        const model = getGeminiModel();
+            // Get model with custom system instruction if provided
+            const model = getGeminiModel();
 
-        // If we have a custom system instruction from the messages, create a new model instance
-        let finalModel = model;
-        if (systemInstruction && systemInstruction !== SYSTEM_PROMPT) {
-            finalModel = genAI.getGenerativeModel({
-                model: defaultConfig.model,
-                generationConfig: {
-                    temperature: defaultConfig.temperature,
-                    topP: defaultConfig.topP,
-                    topK: defaultConfig.topK,
-                    maxOutputTokens: defaultConfig.maxOutputTokens,
-                },
-                systemInstruction: systemInstruction,
+            // If we have a custom system instruction from the messages, create a new model instance
+            let finalModel = model;
+            if (systemInstruction && systemInstruction !== SYSTEM_PROMPT) {
+                finalModel = genAI.getGenerativeModel({
+                    model: defaultConfig.model,
+                    generationConfig: {
+                        temperature: defaultConfig.temperature,
+                        topP: defaultConfig.topP,
+                        topK: defaultConfig.topK,
+                        maxOutputTokens: defaultConfig.maxOutputTokens,
+                    },
+                    systemInstruction: systemInstruction,
+                });
+            }
+
+            // Generate response using Gemini
+            const result = await finalModel.generateContent({
+                contents: geminiMessages.map(msg => ({
+                    role: msg.role,
+                    parts: msg.parts
+                }))
             });
+
+            const response = await result.response;
+            const text = response.text().trim();
+
+            // Extract token usage from response metadata
+            const usageMetadata = response.usageMetadata;
+            const outputTokens = usageMetadata?.candidatesTokenCount || performanceMonitor.estimateTokenCount(text);
+            const totalTokens = usageMetadata?.totalTokenCount || (inputTokens + outputTokens);
+
+            const responseTime = Date.now() - startTime;
+
+            // Log successful call with Gemini usage metadata
+            logSuccessfulCall('general_response', inputTokens, outputTokens, responseTime, usageMetadata, defaultConfig.model);
+
+            return text;
+        } catch (error: any) {
+            const responseTime = Date.now() - startTime;
+            const errorMessage = error.message || 'Unknown Gemini API error';
+
+            // Log failed call
+            logFailedCall('general_response', inputTokens, responseTime, errorMessage, defaultConfig.model);
+
+            // Handle error using existing error handler
+            throw await handleGeminiError(error, 'general_response');
         }
-
-        // Generate response using Gemini
-        const result = await finalModel.generateContent({
-            contents: geminiMessages.map(msg => ({
-                role: msg.role,
-                parts: msg.parts
-            }))
-        });
-
-        const response = await result.response;
-        const text = response.text().trim();
-
-        // Extract token usage from response metadata
-        const usageMetadata = response.usageMetadata;
-        const outputTokens = usageMetadata?.candidatesTokenCount || performanceMonitor.estimateTokenCount(text);
-        const totalTokens = usageMetadata?.totalTokenCount || (inputTokens + outputTokens);
-
-        const responseTime = Date.now() - startTime;
-
-        // Log successful call with Gemini usage metadata
-        logSuccessfulCall('general_response', inputTokens, outputTokens, responseTime, usageMetadata, defaultConfig.model);
-
-        return text;
-    } catch (error: any) {
-        const responseTime = Date.now() - startTime;
-        const errorMessage = error.message || 'Unknown Gemini API error';
-
-        // Check if this is a 503 error and we haven't exceeded retry limit
-        if (error.status === 503 && retryCount < 2) {
-            console.log(`Gemini API overloaded, retrying (${retryCount + 1}/3)...`);
-            const delay = Math.pow(2, retryCount) * 1000; // Exponential backoff
-            await new Promise(resolve => setTimeout(resolve, delay));
-            return getGeminiResponse(messages, retryCount + 1);
-        }
-
-        // Log failed call
-        logFailedCall('general_response', inputTokens, responseTime, errorMessage, defaultConfig.model);
-
-        // Handle error using existing error handler
-        throw await handleGeminiError(error, 'general_response', retryCount);
-    }
+    }, 3, 1000);
 }
 
 /**
@@ -466,117 +449,110 @@ export function logGeminiAPICall(
 export async function extractMeetingIntent(
     userMessageOrMessages: string | ConversationMessage[],
     conversationContextOrEngine?: ConversationMessage[] | any,
-    currentMeetingData?: MeetingData,
-    retryCount: number = 0
+    currentMeetingData?: MeetingData
 ): Promise<MeetingExtraction & { contextualConfidence: number; extractedFields?: any; missingFields?: string[] }> {
 
-    // Handle both old and new function signatures for backward compatibility
-    let userMessage: string;
-    let conversationContext: ConversationMessage[] = [];
+    return await retryWithExponentialBackoff(async () => {
+        // Handle both old and new function signatures for backward compatibility
+        let userMessage: string;
+        let conversationContext: ConversationMessage[] = [];
 
-    if (typeof userMessageOrMessages === 'string') {
-        // Old signature: extractMeetingIntent(userMessage, conversationContext, currentMeetingData)
-        userMessage = userMessageOrMessages;
-        conversationContext = conversationContextOrEngine as ConversationMessage[] || [];
-    } else {
-        // New signature: extractMeetingIntent(messages, contextEngine)
-        const messages = userMessageOrMessages as ConversationMessage[];
-        conversationContext = messages;
-        userMessage = messages.length > 0 ? messages[messages.length - 1].content : '';
-    }
+        if (typeof userMessageOrMessages === 'string') {
+            // Old signature: extractMeetingIntent(userMessage, conversationContext, currentMeetingData)
+            userMessage = userMessageOrMessages;
+            conversationContext = conversationContextOrEngine as ConversationMessage[] || [];
+        } else {
+            // New signature: extractMeetingIntent(messages, contextEngine)
+            const messages = userMessageOrMessages as ConversationMessage[];
+            conversationContext = messages;
+            userMessage = messages.length > 0 ? messages[messages.length - 1].content : '';
+        }
 
-    // Analyze conversation context for better intent detection
-    const contextAnalysis = analyzeConversationContext(conversationContext, currentMeetingData);
+        // Analyze conversation context for better intent detection
+        const contextAnalysis = analyzeConversationContext(conversationContext, currentMeetingData);
 
-    // Build compressed context string optimized for token efficiency
-    const contextString = buildCompressedContext(conversationContext, contextAnalysis);
+        // Build compressed context string optimized for token efficiency
+        const contextString = buildCompressedContext(conversationContext, contextAnalysis);
 
-    // Apply the enhanced prompt with actual values
-    const extractionPrompt = MEETING_CREATION_PROMPTS.MEETING_INTENT_EXTRACTION
-        .replace('{userMessage}', userMessage)
-        .replace('{context}', contextString);
+        // Apply the enhanced prompt with actual values
+        const extractionPrompt = MEETING_CREATION_PROMPTS.MEETING_INTENT_EXTRACTION
+            .replace('{userMessage}', userMessage)
+            .replace('{context}', contextString);
 
-    const startTime = Date.now();
-    const inputTokens = performanceMonitor.estimateTokenCount(extractionPrompt);
-
-    try {
-        // Get model with specific configuration for intent extraction
-        const model = getGeminiModel({
-            temperature: 0.0, // Deterministic for consistent parsing
-            maxOutputTokens: 200
-        });
-
-        const result = await model.generateContent(extractionPrompt);
-
-        const response = await result.response;
-        const content = response.text().trim();
-
-        // Extract token usage from response metadata
-        const usageMetadata = response.usageMetadata;
-        const outputTokens = usageMetadata?.candidatesTokenCount || performanceMonitor.estimateTokenCount(content);
-        const responseTime = Date.now() - startTime;
-
-        // Log successful call with Gemini usage metadata
-        logSuccessfulCall('meeting_intent_extraction', inputTokens, outputTokens, responseTime, usageMetadata, 'gemini-1.5-flash');
+        const startTime = Date.now();
+        const inputTokens = performanceMonitor.estimateTokenCount(extractionPrompt);
 
         try {
-            const cleanedContent = cleanJsonResponse(content);
-            const extraction = JSON.parse(cleanedContent) as MeetingExtraction;
+            // Get model with specific configuration for intent extraction
+            const model = getGeminiModel({
+                temperature: 0.0, // Deterministic for consistent parsing
+                maxOutputTokens: 200
+            });
 
-            // Calculate contextual confidence based on conversation history
-            const contextualConfidence = calculateContextualConfidence(
-                extraction,
-                contextAnalysis,
-                userMessage
-            );
+            const result = await model.generateContent(extractionPrompt);
 
-            // Enhance extraction with context-aware field completion
-            const enhancedExtraction = enhanceExtractionWithContext(
-                extraction,
-                contextAnalysis,
-                currentMeetingData
-            );
+            const response = await result.response;
+            const content = response.text().trim();
 
-            return {
-                ...enhancedExtraction,
-                contextualConfidence,
-                extractedFields: enhancedExtraction.fields,
-                missingFields: enhancedExtraction.missing
-            };
+            // Extract token usage from response metadata
+            const usageMetadata = response.usageMetadata;
+            const outputTokens = usageMetadata?.candidatesTokenCount || performanceMonitor.estimateTokenCount(content);
+            const responseTime = Date.now() - startTime;
 
-        } catch (parseError) {
-            console.error('Failed to parse meeting extraction JSON:', content);
-            // Return default "other" intent if parsing fails
-            return {
-                intent: 'other',
-                confidence: 0,
-                contextualConfidence: 0,
-                fields: {
-                    participants: []
-                },
-                missing: [],
-                extractedFields: { participants: [] },
-                missingFields: []
-            } as MeetingExtraction & { contextualConfidence: number; extractedFields?: any; missingFields?: string[] };
+            // Log successful call with Gemini usage metadata
+            logSuccessfulCall('meeting_intent_extraction', inputTokens, outputTokens, responseTime, usageMetadata, 'gemini-1.5-flash');
+
+            try {
+                const cleanedContent = cleanJsonResponse(content);
+                const extraction = JSON.parse(cleanedContent) as MeetingExtraction;
+
+                // Calculate contextual confidence based on conversation history
+                const contextualConfidence = calculateContextualConfidence(
+                    extraction,
+                    contextAnalysis,
+                    userMessage
+                );
+
+                // Enhance extraction with context-aware field completion
+                const enhancedExtraction = enhanceExtractionWithContext(
+                    extraction,
+                    contextAnalysis,
+                    currentMeetingData
+                );
+
+                return {
+                    ...enhancedExtraction,
+                    contextualConfidence,
+                    extractedFields: enhancedExtraction.fields,
+                    missingFields: enhancedExtraction.missing
+                };
+
+            } catch (parseError) {
+                console.error('Failed to parse meeting extraction JSON:', content);
+                // Return default "other" intent if parsing fails
+                return {
+                    intent: 'other',
+                    confidence: 0,
+                    contextualConfidence: 0,
+                    fields: {
+                        participants: []
+                    },
+                    missing: [],
+                    extractedFields: { participants: [] },
+                    missingFields: []
+                } as MeetingExtraction & { contextualConfidence: number; extractedFields?: any; missingFields?: string[] };
+            }
+        } catch (error: any) {
+            const responseTime = Date.now() - startTime;
+            const errorMessage = error.message || 'Unknown Gemini API error';
+
+            // Log failed call
+            logFailedCall('meeting_intent_extraction', inputTokens, responseTime, errorMessage, 'gemini-1.5-flash');
+
+            console.error('Error extracting meeting intent:', error);
+            throw await handleGeminiError(error, 'meeting_intent_extraction');
         }
-    } catch (error: any) {
-        const responseTime = Date.now() - startTime;
-        const errorMessage = error.message || 'Unknown Gemini API error';
-
-        // Check if this is a 503 error and we haven't exceeded retry limit
-        if (error.status === 503 && retryCount < 2) {
-            console.log(`Gemini API overloaded for intent extraction, retrying (${retryCount + 1}/3)...`);
-            const delay = Math.pow(2, retryCount) * 1000; // Exponential backoff
-            await new Promise(resolve => setTimeout(resolve, delay));
-            return extractMeetingIntent(userMessageOrMessages, conversationContextOrEngine, currentMeetingData, retryCount + 1);
-        }
-
-        // Log failed call
-        logFailedCall('meeting_intent_extraction', inputTokens, responseTime, errorMessage, 'gemini-1.5-flash');
-
-        console.error('Error extracting meeting intent:', error);
-        throw await handleGeminiError(error, 'meeting_intent_extraction', retryCount);
-    }
+    }, 3, 1000);
 }
 
 /**
@@ -795,59 +771,61 @@ export function extractTopicsFromContext(messages: ConversationMessage[]): strin
 }
 
 /**
- * Generate meeting titles using Gemini
+ * Generate meeting titles using Gemini with retry logic
  */
 export async function generateMeetingTitles(purpose: string, participants: string[], context: string = ''): Promise<TitleSuggestion> {
-    // Apply the enhanced prompt with actual values
-    const titlePrompt = MEETING_CREATION_PROMPTS.TITLE_GENERATION
-        .replace('{purpose}', purpose)
-        .replace('{participants}', participants.join(', '))
-        .replace('{context}', context);
+    return await retryWithExponentialBackoff(async () => {
+        // Apply the enhanced prompt with actual values
+        const titlePrompt = MEETING_CREATION_PROMPTS.TITLE_GENERATION
+            .replace('{purpose}', purpose)
+            .replace('{participants}', participants.join(', '))
+            .replace('{context}', context);
 
-    const startTime = Date.now();
-    const inputTokens = performanceMonitor.estimateTokenCount(titlePrompt);
-
-    try {
-        // Get model with specific configuration for title generation
-        const model = getGeminiModel({
-            temperature: 0.2,
-            maxOutputTokens: 120
-        });
-
-        const result = await model.generateContent(titlePrompt);
-
-        const response = await result.response;
-        const content = response.text().trim();
-
-        // Extract token usage from response metadata
-        const usageMetadata = response.usageMetadata;
-        const outputTokens = usageMetadata?.candidatesTokenCount || performanceMonitor.estimateTokenCount(content);
-        const responseTime = Date.now() - startTime;
-
-        // Log successful call with Gemini usage metadata
-        logSuccessfulCall('meeting_title_generation', inputTokens, outputTokens, responseTime, usageMetadata, 'gemini-1.5-flash');
+        const startTime = Date.now();
+        const inputTokens = performanceMonitor.estimateTokenCount(titlePrompt);
 
         try {
-            const cleanedContent = cleanJsonResponse(content);
-            return JSON.parse(cleanedContent) as TitleSuggestion;
-        } catch (parseError) {
-            console.error('Failed to parse title suggestions JSON:', content);
-            // Return default suggestions if parsing fails
-            return {
-                suggestions: ["Team Meeting", "Discussion Session", "Project Sync"],
-                context: "General meeting"
-            } as TitleSuggestion;
+            // Get model with specific configuration for title generation
+            const model = getGeminiModel({
+                temperature: 0.2,
+                maxOutputTokens: 120
+            });
+
+            const result = await model.generateContent(titlePrompt);
+
+            const response = await result.response;
+            const content = response.text().trim();
+
+            // Extract token usage from response metadata
+            const usageMetadata = response.usageMetadata;
+            const outputTokens = usageMetadata?.candidatesTokenCount || performanceMonitor.estimateTokenCount(content);
+            const responseTime = Date.now() - startTime;
+
+            // Log successful call with Gemini usage metadata
+            logSuccessfulCall('meeting_title_generation', inputTokens, outputTokens, responseTime, usageMetadata, 'gemini-1.5-flash');
+
+            try {
+                const cleanedContent = cleanJsonResponse(content);
+                return JSON.parse(cleanedContent) as TitleSuggestion;
+            } catch (parseError) {
+                console.error('Failed to parse title suggestions JSON:', content);
+                // Return default suggestions if parsing fails
+                return {
+                    suggestions: ["Team Meeting", "Discussion Session", "Project Sync"],
+                    context: "General meeting"
+                } as TitleSuggestion;
+            }
+        } catch (error: any) {
+            const responseTime = Date.now() - startTime;
+            const errorMessage = error.message || 'Unknown Gemini API error';
+
+            // Log failed call
+            logFailedCall('meeting_title_generation', inputTokens, responseTime, errorMessage, 'gemini-1.5-flash');
+
+            console.error('Error generating meeting titles:', error);
+            throw handleGeminiError(error, 'meeting_title_generation');
         }
-    } catch (error: any) {
-        const responseTime = Date.now() - startTime;
-        const errorMessage = error.message || 'Unknown Gemini API error';
-
-        // Log failed call
-        logFailedCall('meeting_title_generation', inputTokens, responseTime, errorMessage, 'gemini-1.5-flash');
-
-        console.error('Error generating meeting titles:', error);
-        throw handleGeminiError(error, 'meeting_title_generation');
-    }
+    }, 3, 1000);
 }
 
 /**

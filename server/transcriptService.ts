@@ -1,6 +1,7 @@
 import { google } from 'googleapis';
-import { User } from '../shared/schema';
+import { User, MeetingData } from '../shared/schema';
 import { getGeminiResponse } from './aiInterface';
+import { generateResponse as mistralGenerateResponse } from './mistralService.js';
 import { performanceMonitor } from './performanceMonitor';
 import * as fs from 'fs';
 import * as path from 'path';
@@ -16,6 +17,7 @@ export interface MeetingTranscript {
   duration: number;
   generatedAt: Date;
   wordCount: number;
+  filePath?: string;
 }
 
 /**
@@ -30,6 +32,7 @@ export interface MeetingSummary {
   actionItems: string[];
   generatedAt: Date;
   wordCount: number;
+  filePath?: string;
 }
 
 /**
@@ -110,49 +113,53 @@ export class TranscriptService {
     try {
       console.log(`🎬 Generating transcript for meeting: ${title}`);
 
-      // Create detailed transcript prompt
-      const transcriptPrompt = `
-        Generate a comprehensive, realistic meeting transcript for the following meeting:
+      // Create detailed transcript prompt for Mistral
+      const transcriptPrompt = `Generate a comprehensive, realistic meeting transcript for the following meeting:
 
-        MEETING DETAILS:
-        - Title: "${title}"
-        - Purpose: "${enhancedPurpose}"
-        - Duration: ${duration} minutes
-        - Participants: ${attendees.join(', ')}
-        - Start Time: ${startTime.toLocaleString()}
-        ${meetingLink ? `- Meeting Link: ${meetingLink}` : ''}
+MEETING DETAILS:
+- Title: "${title}"
+- Purpose: "${enhancedPurpose}"
+- Duration: ${duration} minutes
+- Participants: ${attendees.join(', ')}
+- Start Time: ${startTime.toLocaleString()}
+${meetingLink ? `- Meeting Link: ${meetingLink}` : ''}
 
-        REQUIREMENTS:
-        1. Create a realistic, professional meeting transcript
-        2. Include natural conversation flow between participants
-        3. Show how the meeting addresses the enhanced purpose
-        4. Include discussion of challenges, solutions, and decisions
-        5. Make it detailed enough to extract meaningful tasks and action items
-        6. Include timestamps and speaker identification
-        7. Show progression from introduction through discussion to action items
-        8. End with clear next steps and assignments
-        9. Make it 800-1200 words for comprehensive analysis
-        10. Use professional language appropriate for the meeting type
+CRITICAL REQUIREMENTS:
+1. Create a LONG, detailed, realistic professional meeting transcript (1200-2000 words)
+2. Include ALL participants in the conversation, including the meeting organizer
+3. Make it conversational with natural flow, personal touches, and realistic dialogue
+4. Include casual elements like "How's the family?", inside jokes, and team banter
+5. Show progression: introductions → main discussion → problem-solving → decisions → action items → wrap-up
+6. Ensure every attendee speaks multiple times and contributes meaningfully
+7. Make discussions substantive and directly related to the meeting purpose
+8. Include specific challenges, solutions, decisions, and assigned action items
+9. Use professional language but with realistic conversational elements
+10. End with clear next steps, deadlines, and responsible parties
 
-        TRANSCRIPT FORMAT:
-        [Time] Speaker Name: Dialogue and discussion content
+TRANSCRIPT FORMAT:
+[09:00:00] Speaker Name (Role): Dialogue and discussion content
 
-        [Time] Another Speaker: Response and follow-up discussion
+[09:05:30] Another Speaker (Role): Response and follow-up discussion
 
-        Include sections for:
-        - Opening and introductions
-        - Main discussion topics
-        - Problem-solving and decision making
-        - Action item assignment
-        - Meeting wrap-up and next steps
+MANDATORY SECTIONS TO INCLUDE:
+- Opening introductions with personal touches
+- Detailed discussion of the main purpose and challenges
+- Problem identification and brainstorming solutions
+- Decision making process with different viewpoints
+- Action item assignment with specific deadlines and responsibilities
+- Meeting wrap-up with summary and next steps
 
-        Focus on creating substantive discussion that would naturally lead to actionable tasks.
-      `;
+PARTICIPANT ROLES:
+- Use realistic names and roles based on email addresses
+- Include the meeting organizer as an active participant
+- Make sure everyone contributes to the discussion
+
+Focus on creating authentic, lengthy discussion that naturally leads to actionable tasks and demonstrates real team collaboration.`;
 
       const messages = [
         {
           role: 'system',
-          content: 'You are a professional meeting facilitator and transcript writer. Create realistic, detailed meeting transcripts that capture authentic professional discussions and naturally lead to actionable outcomes.'
+          content: 'You are a professional meeting facilitator and transcript writer. Create extremely detailed, realistic meeting transcripts (1200-2000 words) that capture authentic professional discussions with personal elements, natural conversation flow, and comprehensive coverage of all topics. Every participant must speak multiple times. Include casual conversation, challenges, solutions, decisions, and specific action items with deadlines.'
         },
         {
           role: 'user',
@@ -160,11 +167,24 @@ export class TranscriptService {
         }
       ];
 
-      const transcriptContent = await getGeminiResponse(messages);
+      // Use Mistral for transcript generation
+      let transcriptContent: string;
+      try {
+        transcriptContent = await mistralGenerateResponse(messages as any);
 
-      // Validate transcript content
-      if (!transcriptContent || transcriptContent.length < 500) {
-        throw new Error('Generated transcript too short');
+        // Validate transcript content (less strict for Mistral)
+        if (!transcriptContent || transcriptContent.length < 800) {
+          throw new Error('Generated transcript too short');
+        }
+      } catch (error) {
+        console.warn('Mistral transcript generation failed, using fallback:', error);
+        // Use fallback transcript generation
+        transcriptContent = this.createFallbackTranscript(
+          { title, enhancedPurpose, startTime, endTime: new Date(startTime.getTime() + duration * 60 * 1000) },
+          attendees,
+          duration,
+          startTime
+        );
       }
 
       const transcript: MeetingTranscript = {
@@ -177,25 +197,31 @@ export class TranscriptService {
         wordCount: transcriptContent.split(' ').length
       };
 
-      // Save transcript to file
-      await this.saveTranscriptToFile(transcript);
+      // Save transcript to file and get file path
+      const filePath = await this.saveTranscriptToFile(transcript);
+
+      // Add file path to transcript object
+      const transcriptWithPath = {
+        ...transcript,
+        filePath: filePath
+      };
 
       // Record performance metrics
       performanceMonitor.recordAPICall({
-        service: 'gemini',
+        service: 'mistral',
         operation: 'transcript_generation',
         tokenCount: { input: 0, output: 0, total: 0 },
         responseTime: Date.now() - startTimeMs,
         success: true
       });
 
-      console.log(`✅ Transcript generated successfully: ${transcript.wordCount} words`);
-      return transcript;
+      console.log(`✅ Transcript generated successfully: ${transcript.wordCount} words, saved to: ${filePath}`);
+      return transcriptWithPath;
 
     } catch (error: any) {
       console.error('Error generating meeting transcript:', error);
       performanceMonitor.recordAPICall({
-        service: 'gemini',
+        service: 'mistral',
         operation: 'transcript_generation',
         tokenCount: { input: 0, output: 0, total: 0 },
         responseTime: Date.now() - startTimeMs,
@@ -250,7 +276,7 @@ export class TranscriptService {
         }
       ];
 
-      const summaryContent = await getGeminiResponse(messages);
+      const summaryContent = await mistralGenerateResponse(messages as any);
 
       // Extract key points, decisions, and action items using AI
       const extractionPrompt = `
@@ -281,7 +307,7 @@ export class TranscriptService {
       let extractedData: { keyPoints: string[], decisions: string[], actionItems: string[] } = { keyPoints: [], decisions: [], actionItems: [] };
 
       try {
-        const extractionResponse = await getGeminiResponse(extractionMessages);
+        const extractionResponse = await mistralGenerateResponse(extractionMessages as any);
         extractedData = JSON.parse(extractionResponse);
       } catch (parseError) {
         console.warn('Failed to parse extraction data, using fallback');
@@ -300,25 +326,31 @@ export class TranscriptService {
         wordCount: summaryContent.split(' ').length
       };
 
-      // Save summary to file
-      await this.saveSummaryToFile(summary);
+      // Save summary to file and get file path
+      const filePath = await this.saveSummaryToFile(summary);
+
+      // Add file path to summary object
+      const summaryWithPath = {
+        ...summary,
+        filePath: filePath
+      };
 
       // Record performance metrics
       performanceMonitor.recordAPICall({
-        service: 'gemini',
+        service: 'mistral',
         operation: 'summary_generation',
         tokenCount: { input: 0, output: 0, total: 0 },
         responseTime: Date.now() - startTimeMs,
         success: true
       });
 
-      console.log(`✅ Summary generated successfully: ${summary.wordCount} words`);
-      return summary;
+      console.log(`✅ Summary generated successfully: ${summary.wordCount} words, saved to: ${filePath}`);
+      return summaryWithPath;
 
     } catch (error: any) {
       console.error('Error generating meeting summary:', error);
       performanceMonitor.recordAPICall({
-        service: 'gemini',
+        service: 'mistral',
         operation: 'summary_generation',
         tokenCount: { input: 0, output: 0, total: 0 },
         responseTime: Date.now() - startTimeMs,
@@ -336,7 +368,7 @@ export class TranscriptService {
     const startTimeMs = Date.now();
 
     try {
-      console.log(`📋 Extracting tasks from summary: ${summary.title}`);
+      console.log(`📋 Starting task extraction for meeting: ${summary.title} (ID: ${summary.meetingId})`);
 
       const taskExtractionPrompt = `
         Analyze the following meeting summary and extract actionable tasks:
@@ -387,10 +419,12 @@ export class TranscriptService {
         }
       ];
 
-      const tasksResponse = await getGeminiResponse(messages);
+      console.log(`🤖 Sending task extraction request to AI service...`);
+      const tasksResponse = await mistralGenerateResponse(messages as any);
       let tasks: MeetingTask[] = [];
 
       try {
+        console.log(`🔍 Parsing AI response to extract tasks...`);
         const parsedTasks = JSON.parse(tasksResponse);
         tasks = parsedTasks.map((task: any, index: number) => ({
           id: `task_${summary.meetingId}_${index + 1}`,
@@ -405,27 +439,37 @@ export class TranscriptService {
           category: task.category || 'general',
           estimatedHours: task.estimatedHours || 2
         }));
+        console.log(`✅ Successfully parsed ${tasks.length} tasks from AI response`);
       } catch (parseError) {
-        console.warn('Failed to parse tasks, using fallback extraction');
+        console.warn('⚠️ Failed to parse tasks from AI response, using fallback extraction');
         tasks = this.extractTasksFallback(summary);
+        console.log(`✅ Extracted ${tasks.length} tasks using fallback method`);
+      }
+
+      // Save tasks to file system
+      try {
+        const { taskFileStorage } = await import('./utils/taskFileStorage.js');
+        await taskFileStorage.saveTasks(summary.meetingId, tasks);
+      } catch (fileError) {
+        console.error(`❌ Error saving tasks to file system: ${(fileError as Error).message}`);
       }
 
       // Record performance metrics
       performanceMonitor.recordAPICall({
-        service: 'gemini',
+        service: 'mistral',
         operation: 'task_extraction',
         tokenCount: { input: 0, output: 0, total: 0 },
         responseTime: Date.now() - startTimeMs,
         success: true
       });
 
-      console.log(`✅ Extracted ${tasks.length} tasks from summary`);
+      console.log(`✅ Task extraction completed: ${tasks.length} tasks extracted for meeting: ${summary.title}`);
       return tasks;
 
     } catch (error: any) {
-      console.error('Error extracting tasks from summary:', error);
+      console.error('❌ Error extracting tasks from summary:', error);
       performanceMonitor.recordAPICall({
-        service: 'gemini',
+        service: 'mistral',
         operation: 'task_extraction',
         tokenCount: { input: 0, output: 0, total: 0 },
         responseTime: Date.now() - startTimeMs,
@@ -437,33 +481,28 @@ export class TranscriptService {
   }
 
   /**
-   * Save transcript to file system
+   * Save transcript to file system as JSON
    */
-  private async saveTranscriptToFile(transcript: MeetingTranscript): Promise<void> {
+  private async saveTranscriptToFile(transcript: MeetingTranscript): Promise<string> {
     try {
-      const fileName = `${transcript.meetingId}_transcript.txt`;
+      const fileName = `transcript-${transcript.meetingId}.json`;
       const filePath = path.join(this.TRANSCRIPTS_DIR, fileName);
 
-      const fileContent = `
-MEETING TRANSCRIPT
-==================
-
-Meeting ID: ${transcript.meetingId}
-Title: ${transcript.title}
-Generated: ${transcript.generatedAt.toISOString()}
-Duration: ${transcript.duration} minutes
-Participants: ${transcript.participants.join(', ')}
-Word Count: ${transcript.wordCount}
-
-TRANSCRIPT:
-${transcript.transcript}
-
-==================
-Generated by AI Assistant
-      `.trim();
+      const fileContent = JSON.stringify({
+        meetingId: transcript.meetingId,
+        title: transcript.title,
+        transcript: transcript.transcript,
+        participants: transcript.participants,
+        duration: transcript.duration,
+        generatedAt: transcript.generatedAt.toISOString(),
+        wordCount: transcript.wordCount,
+        filePath: filePath,
+        type: 'transcript'
+      }, null, 2);
 
       fs.writeFileSync(filePath, fileContent, 'utf8');
       console.log(`💾 Transcript saved to: ${filePath}`);
+      return filePath;
     } catch (error: any) {
       console.error('Error saving transcript to file:', error);
       throw new Error(`Failed to save transcript: ${error.message}`);
@@ -471,40 +510,29 @@ Generated by AI Assistant
   }
 
   /**
-   * Save summary to file system
+   * Save summary to file system as JSON
    */
-  private async saveSummaryToFile(summary: MeetingSummary): Promise<void> {
+  private async saveSummaryToFile(summary: MeetingSummary): Promise<string> {
     try {
-      const fileName = `${summary.meetingId}_summary.txt`;
+      const fileName = `transcript-${summary.meetingId}-summary.json`;
       const filePath = path.join(this.SUMMARIES_DIR, fileName);
 
-      const fileContent = `
-MEETING SUMMARY
-===============
-
-Meeting ID: ${summary.meetingId}
-Title: ${summary.title}
-Generated: ${summary.generatedAt.toISOString()}
-Word Count: ${summary.wordCount}
-
-SUMMARY:
-${summary.summary}
-
-KEY POINTS:
-${summary.keyPoints.map(point => `- ${point}`).join('\n')}
-
-DECISIONS:
-${summary.decisions.map(decision => `- ${decision}`).join('\n')}
-
-ACTION ITEMS:
-${summary.actionItems.map(item => `- ${item}`).join('\n')}
-
-===============
-Generated by AI Assistant
-      `.trim();
+      const fileContent = JSON.stringify({
+        meetingId: summary.meetingId,
+        title: summary.title,
+        summary: summary.summary,
+        keyPoints: summary.keyPoints,
+        decisions: summary.decisions,
+        actionItems: summary.actionItems,
+        generatedAt: summary.generatedAt.toISOString(),
+        wordCount: summary.wordCount,
+        filePath: filePath,
+        type: 'summary'
+      }, null, 2);
 
       fs.writeFileSync(filePath, fileContent, 'utf8');
       console.log(`💾 Summary saved to: ${filePath}`);
+      return filePath;
     } catch (error: any) {
       console.error('Error saving summary to file:', error);
       throw new Error(`Failed to save summary: ${error.message}`);
@@ -590,7 +618,7 @@ Generated by AI Assistant
    */
   async getTranscript(meetingId: string): Promise<MeetingTranscript | null> {
     try {
-      const fileName = `${meetingId}_transcript.txt`;
+      const fileName = `transcript-${meetingId}.json`;
       const filePath = path.join(this.TRANSCRIPTS_DIR, fileName);
 
       if (!fs.existsSync(filePath)) {
@@ -598,17 +626,17 @@ Generated by AI Assistant
       }
 
       const fileContent = fs.readFileSync(filePath, 'utf8');
-      const lines = fileContent.split('\n');
+      const data = JSON.parse(fileContent);
 
-      // Parse the file content back to MeetingTranscript object
+      // Parse back to MeetingTranscript object
       const transcript: MeetingTranscript = {
-        meetingId: meetingId,
-        title: lines.find(line => line.startsWith('Title: '))?.substring(7) || 'Unknown Meeting',
-        transcript: fileContent.split('TRANSCRIPT:')[1]?.split('==================')[0]?.trim() || '',
-        participants: [],
-        duration: 60,
-        generatedAt: new Date(lines.find(line => line.startsWith('Generated: '))?.substring(11) || Date.now()),
-        wordCount: 0
+        meetingId: data.meetingId,
+        title: data.title,
+        transcript: data.transcript,
+        participants: data.participants,
+        duration: data.duration,
+        generatedAt: new Date(data.generatedAt),
+        wordCount: data.wordCount
       };
 
       return transcript;
@@ -623,7 +651,7 @@ Generated by AI Assistant
    */
   async getSummary(meetingId: string): Promise<MeetingSummary | null> {
     try {
-      const fileName = `${meetingId}_summary.txt`;
+      const fileName = `transcript-${meetingId}-summary.json`;
       const filePath = path.join(this.SUMMARIES_DIR, fileName);
 
       if (!fs.existsSync(filePath)) {
@@ -631,17 +659,18 @@ Generated by AI Assistant
       }
 
       const fileContent = fs.readFileSync(filePath, 'utf8');
+      const data = JSON.parse(fileContent);
 
-      // Parse the file content back to MeetingSummary object
+      // Parse back to MeetingSummary object
       const summary: MeetingSummary = {
-        meetingId: meetingId,
-        title: fileContent.match(/Title: (.+)/)?.[1] || 'Unknown Meeting',
-        summary: fileContent.split('SUMMARY:')[1]?.split('KEY POINTS:')[0]?.trim() || '',
-        keyPoints: [],
-        decisions: [],
-        actionItems: [],
-        generatedAt: new Date(fileContent.match(/Generated: (.+)/)?.[1] || Date.now()),
-        wordCount: 0
+        meetingId: data.meetingId,
+        title: data.title,
+        summary: data.summary,
+        keyPoints: data.keyPoints,
+        decisions: data.decisions,
+        actionItems: data.actionItems,
+        generatedAt: new Date(data.generatedAt),
+        wordCount: data.wordCount
       };
 
       return summary;
@@ -649,6 +678,98 @@ Generated by AI Assistant
       console.error('Error reading summary:', error);
       return null;
     }
+  }
+
+  /**
+   * Creates a comprehensive fallback transcript when AI generation fails
+   */
+  private createFallbackTranscript(
+    meetingData: any,
+    attendees: string[],
+    duration: number,
+    startTime: Date
+  ): string {
+    const participants = attendees.map((email, index) => {
+      const name = email.split('@')[0];
+      const roles = ['Product Manager', 'Developer', 'Designer', 'QA Engineer', 'Project Manager', 'Team Lead'];
+      return `${name} (${roles[index % roles.length]})`;
+    });
+
+    const userParticipant = participants[0] || 'Meeting Organizer';
+    const otherParticipants = participants.slice(1);
+
+    let transcript = `[${startTime.toLocaleTimeString()}] ${userParticipant}: Good ${startTime.getHours() < 12 ? 'morning' : 'afternoon'}, everyone! Thanks so much for joining this ${meetingData.title} meeting. I hope everyone had a great weekend. ${otherParticipants.length > 0 ? otherParticipants[0].split(' ')[0] : 'Team'}, how's the family doing?\n\n`;
+
+    // Add casual conversation
+    if (otherParticipants.length > 0) {
+      transcript += `[${new Date(startTime.getTime() + 2 * 60 * 1000).toLocaleTimeString()}] ${otherParticipants[0].split(' ')[0]} (${otherParticipants[0].split('(')[1].replace(')', '')}): Hey! Family's doing great, thanks for asking. The kids are finally settling into the school routine. How about yours?\n\n`;
+    }
+
+    transcript += `[${new Date(startTime.getTime() + 4 * 60 * 1000).toLocaleTimeString()}] ${userParticipant}: Oh, they're keeping me on my toes as always! Little ones have so much energy. Alright, let's get down to business. As you all know, we're here to discuss ${meetingData.enhancedPurpose || meetingData.purpose || 'our current projects and priorities'}.\n\n`;
+
+    // Main discussion with all participants
+    const discussionPoints = [
+      'current challenges and roadblocks',
+      'potential solutions and approaches',
+      'resource allocation and priorities',
+      'timeline considerations and deadlines',
+      'team capacity and workload distribution'
+    ];
+
+    let currentTime = startTime.getTime() + 6 * 60 * 1000;
+    discussionPoints.forEach((point, index) => {
+      const speaker = otherParticipants[index % otherParticipants.length] || userParticipant;
+      const speakerName = speaker.split(' ')[0];
+
+      transcript += `[${new Date(currentTime).toLocaleTimeString()}] ${speaker}: I've been thinking about ${point}. From my perspective as ${speaker.split('(')[1]?.replace(')', '')}, I see some real opportunities here. For instance, ${point === 'current challenges and roadblocks' ? 'the automation scripts are working well but we need better error handling' : point === 'potential solutions and approaches' ? 'we could implement a more robust monitoring system' : 'we should prioritize the high-impact items first'}.\n\n`;
+
+      // Add responses from other participants
+      otherParticipants.forEach((other, otherIndex) => {
+        if (other !== speaker) {
+          currentTime += 3 * 60 * 1000;
+          const otherName = other.split(' ')[0];
+          transcript += `[${new Date(currentTime).toLocaleTimeString()}] ${otherName} (${other.split('(')[1].replace(')', '')}): I completely agree with that. ${point === 'current challenges and roadblocks' ? 'The error handling has been a pain point for us too.' : point === 'potential solutions and approaches' ? 'A monitoring system would definitely help us catch issues earlier.' : 'That makes sense - let\'s focus on the critical path items.'} What do you think, ${userParticipant.split(' ')[0]}?\n\n`;
+        }
+      });
+
+      currentTime += 5 * 60 * 1000;
+    });
+
+    // Decision making section
+    currentTime += 2 * 60 * 1000;
+    transcript += `[${new Date(currentTime).toLocaleTimeString()}] ${userParticipant}: Great discussion, everyone. Based on what we've covered, I think we should move forward with implementing the enhanced monitoring system and prioritizing the critical automation fixes. ${otherParticipants[0]?.split(' ')[0] || 'Team'}, can you take the lead on the monitoring system?\n\n`;
+
+    if (otherParticipants.length > 0) {
+      currentTime += 2 * 60 * 1000;
+      transcript += `[${new Date(currentTime).toLocaleTimeString()}] ${otherParticipants[0].split(' ')[0]} (${otherParticipants[0].split('(')[1].replace(')', '')}): Absolutely, I'd be happy to lead that. I'll put together a quick proposal by end of day tomorrow and share it with the team for feedback.\n\n`;
+    }
+
+    // Action items
+    currentTime += 3 * 60 * 1000;
+    transcript += `[${new Date(currentTime).toLocaleTimeString()}] ${userParticipant}: Perfect! Let's also make sure we document the current automation processes before making changes. ${otherParticipants[1]?.split(' ')[0] || 'Someone'} from the team, could you handle the documentation?\n\n`;
+
+    if (otherParticipants.length > 1) {
+      currentTime += 2 * 60 * 1000;
+      transcript += `[${new Date(currentTime).toLocaleTimeString()}] ${otherParticipants[1].split(' ')[0]} (${otherParticipants[1].split('(')[1].replace(')', '')}): Sure thing! I'll start on that this afternoon and aim to have a first draft by Friday.\n\n`;
+    }
+
+    // Wrap-up
+    currentTime += 5 * 60 * 1000;
+    transcript += `[${new Date(currentTime).toLocaleTimeString()}] ${userParticipant}: Excellent! So to summarize our action items:\n`;
+    transcript += `1. ${otherParticipants[0]?.split(' ')[0] || 'Team member'} will lead the monitoring system implementation - proposal due tomorrow\n`;
+    transcript += `2. ${otherParticipants[1]?.split(' ')[0] || 'Team member'} will document current automation processes - draft due Friday\n`;
+    transcript += `3. We'll schedule a follow-up meeting next week to review progress\n\n`;
+
+    transcript += `Thanks everyone for the productive discussion! This was really helpful. Let's touch base if any issues come up before our next meeting.\n\n`;
+
+    // Add final casual exchanges
+    otherParticipants.forEach((participant, index) => {
+      currentTime += 1 * 60 * 1000;
+      const name = participant.split(' ')[0];
+      transcript += `[${new Date(currentTime).toLocaleTimeString()}] ${name}: Thanks for organizing this! See you all later.\n\n`;
+    });
+
+    return transcript;
   }
 }
 

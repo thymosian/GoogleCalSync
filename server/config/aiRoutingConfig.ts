@@ -22,6 +22,18 @@ export interface AIRoutingConfiguration {
         cacheEnabled: boolean;
         cacheTTL: number;
     };
+    circuitBreaker: {
+        gemini: {
+            failureThreshold: number;
+            resetTimeout: number;
+            maxRetries: number;
+        };
+        mistral: {
+            failureThreshold: number;
+            resetTimeout: number;
+            maxRetries: number;
+        };
+    };
 }
 
 /**
@@ -97,6 +109,18 @@ export const DEFAULT_ROUTING_CONFIG: AIRoutingConfiguration = {
         maxConcurrentRequests: 10,
         cacheEnabled: false, // Disabled for now
         cacheTTL: 300000 // 5 minutes
+    },
+    circuitBreaker: {
+        gemini: {
+            failureThreshold: 3,
+            resetTimeout: 60000, // 1 minute
+            maxRetries: 3
+        },
+        mistral: {
+            failureThreshold: 3,
+            resetTimeout: 120000, // 2 minutes (longer for Mistral due to rate limits)
+            maxRetries: 2
+        }
     }
 };
 
@@ -262,6 +286,41 @@ export class ConfigurationValidator {
             errors.push('performance.cacheTTL must be a positive number');
         }
 
+        // Validate circuit breaker configuration
+        if (!config.circuitBreaker || typeof config.circuitBreaker !== 'object') {
+            errors.push('circuitBreaker must be an object');
+        } else {
+            // Validate Gemini circuit breaker
+            if (!config.circuitBreaker.gemini || typeof config.circuitBreaker.gemini !== 'object') {
+                errors.push('circuitBreaker.gemini must be an object');
+            } else {
+                if (typeof config.circuitBreaker.gemini.failureThreshold !== 'number' || config.circuitBreaker.gemini.failureThreshold <= 0) {
+                    errors.push('circuitBreaker.gemini.failureThreshold must be a positive number');
+                }
+                if (typeof config.circuitBreaker.gemini.resetTimeout !== 'number' || config.circuitBreaker.gemini.resetTimeout <= 0) {
+                    errors.push('circuitBreaker.gemini.resetTimeout must be a positive number');
+                }
+                if (typeof config.circuitBreaker.gemini.maxRetries !== 'number' || config.circuitBreaker.gemini.maxRetries < 0) {
+                    errors.push('circuitBreaker.gemini.maxRetries must be a non-negative number');
+                }
+            }
+
+            // Validate Mistral circuit breaker
+            if (!config.circuitBreaker.mistral || typeof config.circuitBreaker.mistral !== 'object') {
+                errors.push('circuitBreaker.mistral must be an object');
+            } else {
+                if (typeof config.circuitBreaker.mistral.failureThreshold !== 'number' || config.circuitBreaker.mistral.failureThreshold <= 0) {
+                    errors.push('circuitBreaker.mistral.failureThreshold must be a positive number');
+                }
+                if (typeof config.circuitBreaker.mistral.resetTimeout !== 'number' || config.circuitBreaker.mistral.resetTimeout <= 0) {
+                    errors.push('circuitBreaker.mistral.resetTimeout must be a positive number');
+                }
+                if (typeof config.circuitBreaker.mistral.maxRetries !== 'number' || config.circuitBreaker.mistral.maxRetries < 0) {
+                    errors.push('circuitBreaker.mistral.maxRetries must be a non-negative number');
+                }
+            }
+        }
+
         return {
             valid: errors.length === 0,
             errors
@@ -390,17 +449,25 @@ export class AIRoutingConfigManager {
     }
 
     /**
+     * Get circuit breaker configuration
+     */
+    getCircuitBreakerConfig() {
+        return { ...this.config.circuitBreaker };
+    }
+
+    /**
      * Merge two configuration objects
      */
     private mergeConfigurations(
-        base: AIRoutingConfiguration, 
+        base: AIRoutingConfiguration,
         override: Partial<AIRoutingConfiguration>
     ): AIRoutingConfiguration {
         return {
             rules: { ...base.rules, ...override.rules },
             monitoring: { ...base.monitoring, ...override.monitoring },
             fallback: { ...base.fallback, ...override.fallback },
-            performance: { ...base.performance, ...override.performance }
+            performance: { ...base.performance, ...override.performance },
+            circuitBreaker: { ...base.circuitBreaker, ...override.circuitBreaker }
         };
     }
 

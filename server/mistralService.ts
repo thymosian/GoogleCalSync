@@ -1,6 +1,7 @@
 import { Mistral } from '@mistralai/mistralai';
 import { performanceMonitor } from './performanceMonitor.js';
 import { aiServiceErrorHandler } from './errorHandlers/aiServiceErrorHandler.js';
+import { retryWithExponentialBackoff, isRetryableError } from './utils/retryUtils.js';
 
 // Mistral configuration interface
 export interface MistralConfig {
@@ -156,50 +157,52 @@ function logFailedCall(
 }
 
 /**
- * Core response generation function using Mistral
+ * Core response generation function using Mistral with retry logic
  */
 export async function generateResponse(messages: MistralMessage[]): Promise<string> {
     if (!isMistralAvailable()) {
         throw new Error('Mistral service is not available. Please check MISTRAL_API_KEY configuration.');
     }
 
-    const startTime = Date.now();
-    const inputText = messages.map(m => m.content).join(' ');
-    const inputTokens = performanceMonitor.estimateTokenCount(inputText);
+    return await retryWithExponentialBackoff(async () => {
+        const startTime = Date.now();
+        const inputText = messages.map(m => m.content).join(' ');
+        const inputTokens = performanceMonitor.estimateTokenCount(inputText);
 
-    try {
-        // Ensure we have a system message
-        const messagesWithSystem = messages.some(m => m.role === 'system') 
-            ? messages 
-            : [{ role: 'system' as const, content: SYSTEM_PROMPT }, ...messages];
+        try {
+            // Ensure we have a system message
+            const messagesWithSystem = messages.some(m => m.role === 'system')
+                ? messages
+                : [{ role: 'system' as const, content: SYSTEM_PROMPT }, ...messages];
 
-        const response = await mistralClient!.chat.complete({
-            model: defaultConfig.model,
-            messages: messagesWithSystem,
-            temperature: defaultConfig.temperature,
-            maxTokens: defaultConfig.maxTokens,
-            topP: defaultConfig.topP
-        });
+            const response = await mistralClient!.chat.complete({
+                model: defaultConfig.model,
+                messages: messagesWithSystem,
+                temperature: defaultConfig.temperature,
+                maxTokens: defaultConfig.maxTokens,
+                topP: defaultConfig.topP
+            });
 
-        const rawContent = response.choices?.[0]?.message?.content || '';
-        const content = typeof rawContent === 'string' ? rawContent.trim() : '';
-        const outputTokens = performanceMonitor.estimateTokenCount(content);
-        const responseTime = Date.now() - startTime;
+            const rawContent = response.choices?.[0]?.message?.content || '';
+            const content = typeof rawContent === 'string' ? rawContent.trim() : '';
+            const outputTokens = performanceMonitor.estimateTokenCount(content);
+            const responseTime = Date.now() - startTime;
 
-        // Log successful call
-        logSuccessfulCall('general_response', inputTokens, outputTokens, responseTime, defaultConfig.model);
+            // Log successful call
+            logSuccessfulCall('general_response', inputTokens, outputTokens, responseTime, defaultConfig.model);
 
-        return content;
-    } catch (error: any) {
-        const responseTime = Date.now() - startTime;
-        const errorMessage = error.message || 'Unknown Mistral API error';
+            return content;
+        } catch (error: any) {
+            const responseTime = Date.now() - startTime;
+            const errorMessage = error.message || 'Unknown Mistral API error';
 
-        // Log failed call
-        logFailedCall('general_response', inputTokens, responseTime, errorMessage, defaultConfig.model);
+            // Log failed call
+            logFailedCall('general_response', inputTokens, responseTime, errorMessage, defaultConfig.model);
 
-        // Handle error using existing error handler
-        throw handleMistralError(error, 'general_response');
-    }
+            // Handle error using existing error handler
+            throw handleMistralError(error, 'general_response');
+        }
+    }, 3, 1000);
 }
 
 /**

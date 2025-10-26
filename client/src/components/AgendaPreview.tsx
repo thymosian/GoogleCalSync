@@ -6,116 +6,195 @@ interface AgendaPreviewProps {
 }
 
 export function AgendaPreview({ agendaContent, meetingData }: AgendaPreviewProps) {
-  // Format date and time
-  const formattedDate = meetingData.startTime 
-    ? new Date(meetingData.startTime).toLocaleDateString('en-US', {
-        weekday: 'long',
-        year: 'numeric',
-        month: 'long',
-        day: 'numeric'
-      }) 
-    : 'TBD';
-    
-  const formattedTime = meetingData.startTime 
-    ? new Date(meetingData.startTime).toLocaleTimeString('en-US', {
-        hour: 'numeric',
-        minute: '2-digit',
-        hour12: true
-      }) 
-    : 'TBD';
-    
+  // Format date and time to match email template
+  const formatDate = (date: Date | string | undefined): string => {
+    if (!date) return 'TBD';
+
+    const dateObj = typeof date === 'string' ? new Date(date) : date;
+
+    if (isNaN(dateObj.getTime())) {
+      return 'TBD';
+    }
+
+    return dateObj.toLocaleDateString('en-US', {
+      weekday: 'long',
+      year: 'numeric',
+      month: 'long',
+      day: 'numeric'
+    });
+  };
+
+  const formatTime = (date: Date | string | undefined): string => {
+    if (!date) return 'TBD';
+
+    const dateObj = typeof date === 'string' ? new Date(date) : date;
+
+    if (isNaN(dateObj.getTime())) {
+      return 'TBD';
+    }
+
+    return dateObj.toLocaleTimeString('en-US', {
+      hour: 'numeric',
+      minute: '2-digit',
+      hour12: true,
+      timeZoneName: 'short'
+    });
+  };
+
+  const formattedDate = formatDate(meetingData.startTime);
+  const formattedTime = formatTime(meetingData.startTime);
   const meetingType = meetingData.type === 'online' ? 'Online Meeting' : 'In-Person Meeting';
 
+  // Format agenda content to match the exact email template format
+  const formatAgendaForEmail = (agenda: string): string => {
+    let formatted = '';
+
+    // Add agenda topics with improved styling (matching gmailService.ts)
+    if (agenda && agenda.trim().length > 0) {
+      formatted += '<div style="margin-bottom: 1.5rem;">';
+      formatted += '<h3 style="margin: 0 0 1rem 0; color: #111827; font-weight: 600; font-size: 1.125rem;">Agenda Topics</h3>';
+      formatted += '<ol style="list-style-position: inside; padding-left: 0; margin: 0;">';
+
+      // Split agenda into topics (assuming each line or section is a topic)
+      const topics = agenda.split('\n').filter(line => line.trim().length > 0);
+
+      topics.forEach((topic, index) => {
+        const cleanTopic = topic.replace(/^[-\*\+]\s*/, '').replace(/^\d+\.\s*/, '');
+        if (cleanTopic.trim()) {
+          formatted += `<li style="margin-bottom: 1rem; padding: 0.75rem; background-color: #ffffff; border: 1px solid #e5e7eb; border-radius: 0.375rem; box-shadow: 0 1px 2px 0 rgba(0, 0, 0, 0.05);">
+            <div style="font-weight: 600; font-size: 1.125rem; color: #111827; margin-bottom: 0.5rem;">${cleanTopic}</div>
+            <div style="display: inline-block; background-color: #e5e7eb; color: #4b5563; padding: 0.25rem 0.5rem; border-radius: 9999px; font-size: 0.75rem; margin-right: 0.5rem;">15 min</div>
+          </li>`;
+        }
+      });
+
+      formatted += '</ol>';
+      formatted += '</div>';
+    }
+
+    return formatted;
+  };
+
+  const formattedAgendaContent = formatAgendaForEmail(agendaContent);
+
   return (
-    <div className="relative max-w-3xl mx-auto glass-effect dark:bg-card/90 rounded-xl overflow-hidden premium-shadow-elevated dark:premium-shadow-elevated border border-border">
+    <div style={{
+      fontFamily: 'Arial, sans-serif',
+      lineHeight: '1.6',
+      color: '#333',
+      maxWidth: '600px',
+      margin: '0 auto'
+    }}>
       {/* Header */}
-      <div className="bg-gradient-to-r from-primary to-primary/90 text-primary-foreground p-6 text-center">
-        <h1 className="text-2xl font-serif font-semibold tracking-tight m-0 leading-tight">
+      <div style={{
+        backgroundColor: '#f5f5f5',
+        padding: '20px',
+        borderRadius: '5px',
+        marginBottom: '20px'
+      }}>
+        <h1 style={{
+          color: '#4285f4',
+          fontSize: '24px',
+          margin: '0'
+        }}>
           {meetingData.title}
         </h1>
-        <p className="mt-2 opacity-90 text-sm font-medium">
-          Meeting Agenda & Information
+        <p style={{ margin: '10px 0 0 0' }}>Hello there,</p>
+        <p style={{ margin: '10px 0 0 0' }}>
+          I hope this email finds you well. I'm writing to share the agenda for our upcoming meeting.
         </p>
       </div>
 
       {/* Meeting Details */}
-      <div className="bg-muted/50 dark:bg-muted/20 p-6 m-6 rounded-lg border-l-4 border-primary shadow-sm">
-        <h2 className="m-0 mb-4 text-primary text-lg flex items-center font-serif">
-          <span className="mr-2">📅</span> Meeting Details
+      <div style={{
+        backgroundColor: '#f9f9f9',
+        padding: '15px',
+        borderLeft: '4px solid #4285f4',
+        marginBottom: '20px'
+      }}>
+        <h2 style={{
+          color: '#4285f4',
+          fontSize: '20px',
+          margin: '0 0 15px 0'
+        }}>
+          📅 Meeting Details
         </h2>
-        
-        <div className="space-y-3">
-          {[
-            { label: "Date", value: formattedDate },
-            { label: "Time", value: formattedTime },
-            { label: "Type", value: meetingType },
-            meetingData.meetingLink && { 
-              label: "Meeting Link", 
-              value: <a href={meetingData.meetingLink} className="text-primary no-underline font-medium hover:underline">
-                {meetingData.meetingLink}
-              </a> 
-            }
-          ].filter(Boolean).map((item, index) => (
-            <p key={index} className="my-2.5 text-foreground stagger-item">
-              <strong>{item.label}:</strong> {item.value}
-            </p>
-          ))}
-        </div>
-      </div>
-
-      {/* Decorative divider */}
-      <div className="relative py-3 px-6">
-        <div className="absolute inset-0 flex items-center">
-          <div className="w-full border-t border-border"></div>
-        </div>
-        <div className="relative flex justify-center">
-          <span className="bg-card px-4 text-sm text-muted-foreground font-medium">Agenda Details</span>
-        </div>
-      </div>
-
-      {/* Agenda Content */}
-      <div className="p-6 px-8 bg-card leading-relaxed text-card-foreground prose prose-sm max-w-none prose-headings:font-serif prose-headings:text-primary prose-a:text-primary hover:prose-a:text-primary/80 prose-strong:text-primary/90 dark:prose-invert">
-        <div dangerouslySetInnerHTML={{ __html: agendaContent }} />
-      </div>
-
-      {/* CTA Section */}
-      <div className="text-center p-7 border-t border-border bg-muted/30 dark:bg-muted/10">
-        {meetingData.type === 'online' && meetingData.meetingLink ? (
-          <div>
-            <a 
-              href={meetingData.meetingLink} 
-              className="inline-block muted-gradient-primary text-primary-foreground no-underline py-3.5 px-7 rounded-lg font-semibold text-base premium-shadow-subtle mb-4 hover-lift-subtle hover-glow transition-all"
-            >
-              🚀 Join Meeting Now
-            </a>
-            <p className="mt-4 text-muted-foreground text-sm">
-              Or copy this link: <a href={meetingData.meetingLink} className="text-primary font-medium hover:underline">
+        <p style={{ margin: '5px 0' }}><strong>Date:</strong> {formattedDate}</p>
+        <p style={{ margin: '5px 0' }}><strong>Time:</strong> {formattedTime}</p>
+        <p style={{ margin: '5px 0' }}><strong>Duration:</strong> 60 minutes</p>
+        <p style={{ margin: '5px 0' }}><strong>Type:</strong> {meetingType}</p>
+        {meetingData.meetingLink && (
+          <>
+            <p style={{ margin: '5px 0' }}>
+              <strong>Meeting Link:</strong>{' '}
+              <a href={meetingData.meetingLink} style={{
+                color: '#4285f4',
+                textDecoration: 'none'
+              }}>
                 {meetingData.meetingLink}
               </a>
             </p>
-          </div>
-        ) : (
-          <p className="text-muted-foreground italic py-2">
-            Please review the agenda above and come prepared for the discussion.
-          </p>
+            <a href={meetingData.meetingLink} style={{
+              display: 'inline-block',
+              backgroundColor: '#4285f4',
+              color: 'white',
+              padding: '10px 20px',
+              textDecoration: 'none',
+              borderRadius: '4px',
+              marginTop: '10px'
+            }}>
+              Join Meeting
+            </a>
+          </>
         )}
       </div>
 
-      {/* Footer */}
-      <div className="bg-muted/50 dark:bg-muted/20 p-5 text-center text-sm text-muted-foreground border-t border-border">
-        <p className="m-0">
-          This meeting invitation was generated by GoogleCalSync
-        </p>
-        <p className="mt-2 mb-0">
-          For support, contact the meeting organizer
-        </p>
+      {/* Agenda Section */}
+      <div style={{ marginBottom: '20px' }}>
+        <h2 style={{
+          color: '#4285f4',
+          fontSize: '20px',
+          margin: '0 0 15px 0'
+        }}>
+          📋 Meeting Agenda
+        </h2>
+        <div dangerouslySetInnerHTML={{ __html: formattedAgendaContent }} />
       </div>
-      
-      {/* Subtle branded watermark */}
-      <div className="absolute bottom-4 right-4 opacity-10">
-        <svg width="40" height="40" viewBox="0 0 24 24" fill="none" xmlns="http://www.w3.org/2000/svg">
-          <path d="M12 2C6.48 2 2 6.48 2 12s4.48 10 10 10 10-4.48 10-10S17.52 2 12 2zm0 18c-4.41 0-8-3.59-8-8s3.59-8 8-8 8 3.59 8 8-3.59 8-8 8zm-1-13h2v6h-2zm0 8h2v2h-2z" fill="currentColor"/>
-        </svg>
+
+      {/* Preparation Section */}
+      <div style={{ marginBottom: '20px' }}>
+        <h3 style={{
+          color: '#5f6368',
+          fontSize: '16px',
+          margin: '0 0 10px 0'
+        }}>
+          📝 Please come prepared to:
+        </h3>
+        <ul style={{ paddingLeft: '20px', margin: '0' }}>
+          <li style={{ marginBottom: '5px' }}>Review the agenda items above</li>
+          <li style={{ marginBottom: '5px' }}>Bring any relevant materials or updates</li>
+          <li style={{ marginBottom: '5px' }}>Be ready to participate in discussions</li>
+        </ul>
+      </div>
+
+      {/* Footer */}
+      <div style={{
+        fontSize: '0.9em',
+        color: '#666',
+        marginTop: '30px',
+        paddingTop: '10px',
+        borderTop: '1px solid #eee'
+      }}>
+        <p style={{ margin: '5px 0' }}>
+          If you have any questions or need to discuss anything before the meeting, please don't hesitate to reach out.
+        </p>
+        <p style={{ margin: '5px 0' }}>
+          Looking forward to our productive discussion!
+        </p>
+        <p style={{ margin: '5px 0' }}>
+          Best regards,<br />
+          Meeting Organizer
+        </p>
       </div>
     </div>
   );

@@ -39,7 +39,7 @@ export async function extractMeetingIntent(
 }
 
 /**
- * Generate meeting titles - Using AI router (Gemini primary, Mistral fallback)
+ * Generate meeting titles - Using AI router (Gemini primary, Mistral fallback) with degradation mode
  */
 export async function generateMeetingTitles(
     purpose: string,
@@ -47,17 +47,37 @@ export async function generateMeetingTitles(
     context: string = ''
 ): Promise<TitleSuggestion> {
     try {
-        // Use AI router to respect routing configuration (Gemini primary, Mistral fallback)
+        // Try AI router first
         return await aiRouter.routeRequest<TitleSuggestion>('generateMeetingTitles', [purpose, participants, context]);
     } catch (error) {
         console.error('AI router failed for generateMeetingTitles, falling back to direct Mistral call:', error);
-        // Fallback to direct Mistral call if router fails
-        return generateMeetingTitlesMistral(purpose, participants, context);
+        try {
+            // Try direct Mistral call
+            return await generateMeetingTitlesMistral(purpose, participants, context);
+        } catch (mistralError) {
+            console.error('Mistral fallback failed, using degradation mode:', mistralError);
+            // Degradation mode - use rule-based approach
+            return {
+                suggestions: [
+                    generateBasicTitle(purpose, participants),
+                    "Team Discussion",
+                    "Project Meeting"
+                ],
+                context: "Generated in degradation mode due to service unavailability"
+            };
+        }
     }
 }
 
+// Simple rule-based title generator for degradation mode
+function generateBasicTitle(purpose: string, participants: string[]): string {
+    // Extract key terms from purpose (first 3-4 words or up to 30 chars)
+    const keyTerms = purpose.split(' ').slice(0, 4).join(' ').substring(0, 30);
+    return keyTerms || "Team Meeting";
+}
+
 /**
- * Enhance purpose wording - Using AI router (Gemini primary, Mistral fallback)
+ * Enhance purpose wording - Using AI router (Gemini primary, Mistral fallback) with degradation mode
  */
 export async function enhancePurposeWording(
     purpose: string,
@@ -66,13 +86,46 @@ export async function enhancePurposeWording(
     context: string = ''
 ): Promise<{ enhancedPurpose: string; keyPoints: string[] }> {
     try {
-        // Use AI router to respect routing configuration (Gemini primary, Mistral fallback)
+        // Try AI router first
         return await aiRouter.routeRequest<{ enhancedPurpose: string; keyPoints: string[] }>('enhancePurposeWording', [purpose, title, participants, context]);
     } catch (error) {
         console.error('AI router failed for enhancePurposeWording, falling back to direct Mistral call:', error);
-        // Fallback to direct Mistral call if router fails
-        return enhancePurposeWordingMistral(purpose, title, participants, context);
+        try {
+            // Try direct Mistral call
+            return await enhancePurposeWordingMistral(purpose, title, participants, context);
+        } catch (mistralError) {
+            console.error('Mistral fallback failed, using degradation mode:', mistralError);
+            // Degradation mode - use rule-based approach
+            return {
+                enhancedPurpose: generateBasicEnhancedPurpose(purpose, title),
+                keyPoints: generateBasicKeyPoints(purpose)
+            };
+        }
     }
+}
+
+// Simple rule-based purpose enhancer for degradation mode
+function generateBasicEnhancedPurpose(purpose: string, title: string): string {
+    let enhanced = purpose.charAt(0).toUpperCase() + purpose.slice(1);
+    if (!enhanced.match(/[.!?]$/)) {
+        enhanced += '.';
+    }
+    if (title && title !== purpose && !enhanced.includes(title)) {
+        enhanced = `${title}: ${enhanced}`;
+    }
+    return enhanced;
+}
+
+// Simple rule-based key points generator for degradation mode
+function generateBasicKeyPoints(purpose: string): string[] {
+    const sentences = purpose.split(/[.!?]+/).filter(s => s.trim().length > 10);
+    if (sentences.length === 0) {
+        return [purpose];
+    }
+    if (sentences.length <= 3) {
+        return sentences.map(s => s.trim());
+    }
+    return sentences.slice(0, 3).map(s => s.trim());
 }
 
 /**

@@ -362,16 +362,55 @@ export class EnvironmentConfigValidator {
      */
     private static isValidMistralModel(model: string): boolean {
         const validModels = [
-            'mistral-tiny',
-            'mistral-small',
-            'mistral-small-latest',
-            'mistral-medium',
-            'mistral-large',
-            'mistral-large-latest',
-            'open-mistral-7b',
-            'open-mixtral-8x7b',
-            'open-mixtral-8x22b'
+            // Core models
+            'mistral-tiny', 'mistral-tiny-latest', 'mistral-tiny-2312', 'mistral-tiny-2407',
+            'mistral-small', 'mistral-small-latest', 'mistral-small-2312', 'mistral-small-2409', 'mistral-small-2501', 'mistral-small-2503', 'mistral-small-2506',
+            'mistral-medium', 'mistral-medium-latest', 'mistral-medium-2505', 'mistral-medium-2508',
+            'mistral-large', 'mistral-large-latest', 'mistral-large-2407', 'mistral-large-2411',
+            
+            // Mini models
+            'ministral-3b-2410', 'ministral-3b-latest',
+            'ministral-8b-2410', 'ministral-8b-latest',
+            
+            // Open models
+            'open-mistral-7b', 'open-mistral-nemo', 'open-mistral-nemo-2407',
+            'open-mixtral-8x7b', 'open-mixtral-8x22b', 'open-mixtral-8x22b-2404',
+            
+            // Specialized models
+            'codestral-latest', 'codestral-2411-rc5', 'codestral-2412', 'codestral-2501', 'codestral-2508',
+            'devstral-small-latest', 'devstral-small-2505', 'devstral-small-2507',
+            'devstral-medium-latest', 'devstral-medium-2507',
+            'pixtral-large-latest', 'pixtral-large-2411',
+            'mistral-large-pixtral-2411',
+            'pixtral-12b', 'pixtral-12b-latest', 'pixtral-12b-2409',
+            'magistral-small-latest', 'magistral-small-2506', 'magistral-small-2507', 'magistral-small-2509',
+            'magistral-medium-latest', 'magistral-medium-2506', 'magistral-medium-2507', 'magistral-medium-2509',
+            'voxtral-mini-latest', 'voxtral-mini-2507',
+            'voxtral-small-latest', 'voxtral-small-2507',
+            
+            // Embedding and utility models
+            'mistral-embed', 'mistral-embed-2312',
+            'codestral-embed', 'codestral-embed-2505',
+            'mistral-moderation-latest', 'mistral-moderation-2411',
+            'mistral-ocr-latest', 'mistral-ocr-2503', 'mistral-ocr-2505',
+            'voxtral-mini-transcribe-2507'
         ];
+        
+        // If the model follows a known pattern but isn't in our list, consider it valid
+        // This handles future model versions without requiring constant updates
+        if (!validModels.includes(model)) {
+            const knownPrefixes = [
+                'mistral-', 'ministral-', 'open-mistral-', 'open-mixtral-',
+                'codestral-', 'devstral-', 'pixtral-', 'magistral-', 'voxtral-'
+            ];
+            
+            for (const prefix of knownPrefixes) {
+                if (model.startsWith(prefix)) {
+                    return true;
+                }
+            }
+        }
+        
         return validModels.includes(model);
     }
     

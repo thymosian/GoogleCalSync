@@ -12,6 +12,7 @@ import { events, meetingDrafts } from '../shared/schema.js';
 import { eq } from 'drizzle-orm';
 import { DynamicMessageGenerator } from './dynamicMessageGenerator.js';
 import { transcriptService, type MeetingTranscript, type MeetingSummary, type MeetingTask } from './transcriptService.js';
+import { retryWithExponentialBackoff, isRetryableError } from './utils/retryUtils.js';
 import type {
     MeetingData,
     ConversationMessage,
@@ -2648,32 +2649,53 @@ export class MeetingWorkflowOrchestrator {
     }
 
     /**
-     * Store extracted tasks in database
+     * Store extracted tasks in database with transaction handling and retry logic
      */
     private async storeMeetingTasks(meetingId: string, tasks: MeetingTask[]): Promise<void> {
+        console.log(`📋 Starting task storage process for meeting: ${meetingId}`);
+        
+        // First, always save to file system as a primary storage mechanism
+        const { taskFileStorage } = await import('./utils/taskFileStorage.js');
+        await taskFileStorage.saveTasks(meetingId, tasks);
+        
+        // Then try to save to database with retry logic
         try {
-            // Import database operations
-            const { db } = await import('./storage.js');
-            const { tasks: taskTable } = await import('../shared/schema.js');
+            await retryWithExponentialBackoff(async () => {
+                // Import database operations
+                const { db } = await import('./storage.js');
+                const { tasks: taskTable, events: eventTable } = await import('../shared/schema.js');
+                const { eq } = await import('drizzle-orm');
 
-            // Store each task in database
-            for (const task of tasks) {
-                await db.insert(taskTable).values({
-                    eventId: meetingId,
-                    title: task.title,
-                    description: task.description,
-                    assignee: task.assignee || 'Unassigned',
-                    deadline: task.dueDate,
-                    status: task.status,
-                    createdAt: new Date()
-                } as any);
-            }
+                // Use transaction to ensure atomicity
+                await db.transaction(async (tx) => {
+                    // First verify the event exists
+                    const eventCheck = await tx.select().from(eventTable).where(eq(eventTable.id, meetingId));
+                    if (eventCheck.length === 0) {
+                        throw new Error(`Cannot store tasks in database: Event with ID ${meetingId} does not exist`);
+                    }
 
-            console.log(`💾 Stored ${tasks.length} tasks for meeting: ${meetingId}`);
+                    // Insert tasks
+                    for (const task of tasks) {
+                        await tx.insert(taskTable).values({
+                            eventId: meetingId,
+                            title: task.title,
+                            description: task.description,
+                            assignee: task.assignee || 'Unassigned',
+                            deadline: task.dueDate,
+                            status: task.status,
+                            createdAt: new Date()
+                        });
+                    }
+                });
+
+                console.log(`💾 Successfully stored ${tasks.length} tasks in database for meeting: ${meetingId}`);
+            }, 3, 1000);
         } catch (error) {
-            console.error('Error storing meeting tasks:', error);
-            throw error;
+            console.error(`❌ Failed to store tasks in database: ${(error as Error).message}`);
+            console.log(`ℹ️ Note: Tasks are still available in the task files.`);
         }
+        
+        console.log(`✅ Task storage process completed for meeting: ${meetingId}`);
     }
 
     /**

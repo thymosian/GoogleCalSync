@@ -240,8 +240,7 @@ export class AIRouterService {
                 args,
                 rule.fallbackModel,
                 options?.timeout || rule.timeout,
-                options,
-                2 // Fewer retries for fallback
+                options
             );
 
             const fallbackResponseTime = Date.now() - fallbackStartTime;
@@ -324,8 +323,12 @@ export class AIRouterService {
         model: 'gemini' | 'mistral',
         timeout: number,
         options?: RoutingOptions,
-        maxRetries: number = 3
+        maxRetries?: number
     ): Promise<T> {
+        // Use configured maxRetries if not provided
+        if (maxRetries === undefined) {
+            maxRetries = this.getCircuitBreakerConfig()[model].maxRetries;
+        }
         // Check circuit breaker before attempting request
         if (this.isCircuitBreakerOpen(model)) {
             throw this.createCircuitBreakerError(model);
@@ -519,18 +522,23 @@ export class AIRouterService {
 
     private recordFailure(model: 'gemini' | 'mistral', errorClassification: any): void {
         const circuitBreaker = this.serviceHealth[model].circuitBreaker;
+        const config = this.getCircuitBreakerConfig()[model];
         const now = new Date();
         
         circuitBreaker.failureCount++;
         circuitBreaker.lastFailureTime = now;
 
-        // Open circuit breaker after 5 consecutive failures
-        if (circuitBreaker.failureCount >= 5 && !circuitBreaker.isOpen) {
+        // Open circuit breaker after configured failure threshold
+        if (circuitBreaker.failureCount >= config.failureThreshold && !circuitBreaker.isOpen) {
             circuitBreaker.isOpen = true;
-            circuitBreaker.nextRetryTime = new Date(now.getTime() + 60000); // 1 minute
+            circuitBreaker.nextRetryTime = new Date(now.getTime() + config.resetTimeout);
             
             console.error(`[AI Router] Circuit breaker opened for ${model} after ${circuitBreaker.failureCount} failures`);
         }
+    }
+
+    private getCircuitBreakerConfig() {
+        return this.config.circuitBreaker;
     }
 
     private resetCircuitBreaker(model: 'gemini' | 'mistral'): void {
